@@ -33,8 +33,10 @@ Given a job posting (a URL and/or pasted text), do the following, using web sear
 1. Identify the hiring COMPANY, the ROLE title, the LOCATION, and a short summary of what the role focuses on. \
 If a LinkedIn (or other) URL cannot be opened directly, search the web for the company and role to reconstruct \
 the details.
-2. Find the most senior relevant decision-maker to approach — ideally the FOUNDER or CEO; otherwise a Head of \
-Design or equivalent design leader. Give their name and title.
+2. Find the company's FOUNDER or CEO — this is your PRIMARY target. Search hard for them (LinkedIn, the company \
+About/Team page, Crunchbase, press, app-store listings). Only if no founder or CEO can be identified publicly, \
+fall back to a Head of Design, design leader, or the hiring manager. Give their name and title, and note which \
+category they are.
 3. Find a plausible PUBLIC business email for that person. Strongly prefer an address actually published on a \
 public source (company website, app-store developer listing, WHOIS, press, etc.). If you can only infer it from \
 the company's email pattern (e.g. first@domain), mark the confidence as "inferred". Always state where it came from.
