@@ -36,9 +36,12 @@ def _load_google_api():
         globals()['google_auth_exceptions'] = google.auth.exceptions
 
         HAS_GOOGLE_API = True
+        logger.info("Google API libraries loaded successfully")
         return True
-    except ImportError as e:
-        logger.warning(f"Google API not available: {e}")
+    except Exception as e:
+        logger.error(f"Failed to load Google API: {type(e).__name__}: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return False
 
 def _get_streamlit_secrets():
