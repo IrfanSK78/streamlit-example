@@ -100,45 +100,102 @@ def page_discover_lead():
         if score_result['score'] >= 70:
             st.success("✅ This lead qualifies for outreach")
 
-            if st.button("Create Lead & Generate Email", type="primary"):
-                is_dup, dup_info = check_duplicate(
-                    job_url=job_url,
-                    company_domain=company_domain
-                )
+            is_dup, dup_info = check_duplicate(
+                job_url=job_url,
+                company_domain=company_domain
+            )
 
-                if is_dup:
-                    if dup_info['type'] == 'COMPANY_CONTACTED':
-                        st.error(f"Company already contacted: {dup_info['lead_id']} (Status: {dup_info['status']})")
-                        st.stop()
-                    else:
-                        st.warning(f"This job was already researched: {dup_info['lead_id']}")
-
+            if is_dup:
+                if dup_info['type'] == 'COMPANY_CONTACTED':
+                    st.error(f"❌ Company already contacted: {dup_info['lead_id']} (Status: {dup_info['status']})")
+                else:
+                    st.warning(f"⚠️ This job was already researched: {dup_info['lead_id']}")
+            else:
                 is_dnc, dnc_reason = check_do_not_contact(company_domain=company_domain)
                 if is_dnc:
-                    st.error(f"Company is on do-not-contact list: {dnc_reason}")
-                    st.stop()
+                    st.error(f"❌ Company is on do-not-contact list: {dnc_reason}")
+                else:
+                    with st.spinner("Generating personalized email..."):
+                        themes = extract_key_themes(job_research['job_description'] or '')
+                        email_result = generate_email(
+                            job_title=job_research['job_title'] or '',
+                            company_name=company_name or '',
+                            themes=themes,
+                            job_description=job_research['job_description'] or ''
+                        )
 
-                lead_data = {
-                    'company_name': company_name,
-                    'company_domain': company_domain,
-                    'company_website': company_research.get('company_website'),
-                    'job_title': job_research['job_title'],
-                    'job_url': job_url,
-                    'job_description': job_research['job_description'],
-                    'date_discovered': datetime.now().isoformat()
-                }
+                        subject_line = email_result.get('subject', 'Design Opportunity at ' + (company_name or 'Your Company'))
+                        email_body = email_result.get('body', '')
 
-                lead_id = create_lead(lead_data)
-                log_audit(lead_id, 'LEAD_QUALIFIED', actor='USER', details=f'Score: {score_result["score"]}')
+                        lead_data = {
+                            'company_name': company_name,
+                            'company_domain': company_domain,
+                            'company_website': company_research.get('company_website'),
+                            'job_title': job_research['job_title'],
+                            'job_url': job_url,
+                            'job_description': job_research['job_description'],
+                            'date_discovered': datetime.now().isoformat(),
+                            'outreach_subject': subject_line,
+                            'outreach_email': email_body,
+                            'status': 'DRAFT_READY'
+                        }
 
-                update_lead(lead_id, {
-                    'lead_fit_score': score_result['score'],
-                    'fit_score_reasons': str(score_result['factors'])
-                })
+                        lead_id = create_lead(lead_data)
+                        log_audit(lead_id, 'LEAD_QUALIFIED', actor='SYSTEM', details=f'Score: {score_result["score"]}')
 
-                st.success(f"Lead created: {lead_id}")
-                st.session_state.current_lead_id = lead_id
-                st.rerun()
+                        update_lead(lead_id, {
+                            'lead_fit_score': score_result['score'],
+                            'fit_score_reasons': str(score_result['factors'])
+                        })
+
+                        st.subheader("📧 Email Ready to Send")
+                        st.text_input("Subject", value=subject_line, disabled=True)
+                        st.text_area("Email Body", value=email_body, height=300, disabled=True)
+
+                        st.subheader("Send Email")
+                        contact_email = st.text_input(
+                            "Recipient Email",
+                            placeholder="contact@company.com",
+                            key=f"email_input_{lead_id}"
+                        )
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button("✉️ Send Email", type="primary"):
+                                if not contact_email:
+                                    st.error("Please enter a recipient email address")
+                                else:
+                                    with st.spinner("Sending email..."):
+                                        result = send_email(
+                                            recipient_email=contact_email,
+                                            subject_line=subject_line,
+                                            email_body=email_body,
+                                            sender_email="sonia.baig@invasived.com"
+                                        )
+
+                                        if result['success']:
+                                            update_lead(lead_id, {
+                                                'status': 'CONTACTED',
+                                                'date_contacted': datetime.now().isoformat(),
+                                                'contact_email': contact_email
+                                            })
+
+                                            log_audit(
+                                                lead_id,
+                                                'EMAIL_SENT',
+                                                actor='USER',
+                                                details=f"To: {contact_email}, Message ID: {result['message_id']}"
+                                            )
+
+                                            st.success(f"✅ Email sent to {contact_email}!")
+                                            st.info(f"Lead ID: {lead_id}")
+                                        else:
+                                            st.error(f"❌ Failed to send: {result['error']}")
+
+                        with col2:
+                            if st.button("📋 Save & Review Later"):
+                                st.info(f"Lead saved as draft. Find it in Lead History (ID: {lead_id})")
+
         else:
             st.warning(f"Lead score {score_result['score']}/100 - Below threshold of 70")
 
@@ -183,8 +240,8 @@ def page_leads_list():
                 st.write(f"**Contacted:** {lead['date_contacted']}")
 
 def page_review_email():
-    """Page: Review and approve email."""
-    st.header("📧 Review & Approve Email")
+    """Page: Review sent emails."""
+    st.header("📧 Email Review")
 
     lead_id = st.session_state.get('current_lead_id')
     if not lead_id:
@@ -196,34 +253,25 @@ def page_review_email():
         st.error(f"Lead not found: {lead_id}")
         return
 
-    st.subheader(f"{lead['company_name']} - {lead['contact_name'] or 'Contact'}")
+    st.subheader(f"{lead['company_name']} - {lead['job_title']}")
 
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Lead ID", lead_id)
-        st.metric("Fit Score", lead['lead_fit_score'])
+        st.metric("Fit Score", f"{lead['lead_fit_score']}/100")
     with col2:
-        st.write(f"**Company:** {lead['company_name']}")
-        st.write(f"**Job:** {lead['job_title']}")
+        st.write(f"**Status:** {lead['status']}")
+        if lead['date_contacted']:
+            st.write(f"**Sent:** {lead['date_contacted']}")
 
-    if lead['status'] != 'DRAFT_READY' and lead['status'] != 'AWAITING_APPROVAL':
-        if lead['status'] == 'CONTACTED':
-            st.info(f"✅ Email already sent on {lead['date_contacted']}")
-            return
-        else:
-            st.warning(f"Lead status: {lead['status']} - Generate email first")
-            return
+    st.subheader("Email Content")
 
-    st.subheader("Email Details")
-
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        st.write("**To:** ")
-    with col2:
-        st.text_input("Recipient Email", value=lead['contact_email'] or '', disabled=True)
+    if lead['contact_email']:
+        st.write(f"**To:** {lead['contact_email']}")
+    else:
+        st.warning("No contact email on file")
 
     st.text_input("Subject", value=lead['outreach_subject'] or '', disabled=True)
-
     st.text_area("Email Body", value=lead['outreach_email'] or '', height=400, disabled=True)
 
     audit_trail = get_audit_trail(lead_id)
@@ -236,48 +284,46 @@ def page_review_email():
 
     st.divider()
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("✅ APPROVE & SEND", type="primary"):
-            if not lead['contact_email']:
-                st.error("Contact email is required to send")
-                st.stop()
-
-            with st.spinner("Sending email..."):
-                result = send_email(
-                    recipient_email=lead['contact_email'],
-                    subject_line=lead['outreach_subject'],
-                    email_body=lead['outreach_email'],
-                    sender_email="sonia.baig@invasived.com"
-                )
-
-                if result['success']:
-                    update_lead(lead_id, {
-                        'status': 'CONTACTED',
-                        'date_contacted': datetime.now().isoformat()
-                    })
-
-                    log_audit(
-                        lead_id,
-                        'EMAIL_SENT',
-                        actor='USER',
-                        details=f"To: {lead['contact_email']}, Message ID: {result['message_id']}"
-                    )
-
-                    st.success("✅ Email sent successfully!")
-                    st.session_state.current_lead_id = None
-                    st.rerun()
+        if lead['status'] == 'DRAFT_READY':
+            contact_email = st.text_input("Contact Email", placeholder="Enter recipient email to send")
+            if st.button("✉️ Send Draft Email", type="primary"):
+                if not contact_email:
+                    st.error("Please enter contact email")
                 else:
-                    st.error(f"Failed to send: {result['error']}")
+                    with st.spinner("Sending email..."):
+                        result = send_email(
+                            recipient_email=contact_email,
+                            subject_line=lead['outreach_subject'],
+                            email_body=lead['outreach_email'],
+                            sender_email="sonia.baig@invasived.com"
+                        )
+
+                        if result['success']:
+                            update_lead(lead_id, {
+                                'status': 'CONTACTED',
+                                'date_contacted': datetime.now().isoformat(),
+                                'contact_email': contact_email
+                            })
+
+                            log_audit(
+                                lead_id,
+                                'EMAIL_SENT',
+                                actor='USER',
+                                details=f"To: {contact_email}, Message ID: {result['message_id']}"
+                            )
+
+                            st.success("✅ Email sent!")
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to send: {result['error']}")
+        else:
+            st.info(f"✅ Email sent on {lead['date_contacted']}")
 
     with col2:
-        if st.button("✏ Edit Email"):
-            st.session_state.editing_email = True
-            st.rerun()
-
-    with col3:
-        if st.button("❌ Reject Lead"):
+        if st.button("❌ Mark as Not Qualified"):
             update_lead(lead_id, {'status': 'NOT_QUALIFIED'})
             log_audit(lead_id, 'REJECTED_BY_USER', actor='USER')
             st.success("Lead rejected")
