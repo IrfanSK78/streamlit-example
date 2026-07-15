@@ -314,6 +314,110 @@ def page_discover_lead():
 
     st.info("Go to **Pending Approvals** in the sidebar to approve it.")
 
+def page_research_lead():
+    """Page: Paste a job (e.g. LinkedIn), research the company + founder, draft an email."""
+    st.header("🔎 Research a Job")
+    st.write("Paste a job posting — a LinkedIn link works best with the job text pasted below it. "
+             "The AI researches the company, finds the founder or decision-maker and a contact email, "
+             "and drafts an outreach email addressed to them.")
+
+    try:
+        from mailer.lead_researcher import research_and_write
+        from mailer.ai_writer import is_ai_available
+        ai_on = is_ai_available()
+    except Exception:
+        ai_on = False
+
+    if not ai_on:
+        st.warning("This page needs AI. Add an Anthropic API key in **Settings → (how to turn on AI writing)** "
+                   "first, then come back.")
+        return
+
+    job_input = st.text_area(
+        "Job link and/or pasted job description",
+        height=180,
+        placeholder="https://www.linkedin.com/jobs/view/1234567890/\n\n(Optional but recommended: paste the "
+                    "job description text here too for the most accurate result.)"
+    )
+
+    if st.button("🔎 Research & Draft Email", type="primary") and job_input.strip():
+        with st.spinner("Researching the company, finding the decision-maker, and drafting the email… "
+                        "this can take up to a minute."):
+            st.session_state.last_research = research_and_write(job_input)
+
+    data = st.session_state.get('last_research')
+    if not data:
+        return
+
+    if data.get('error'):
+        st.error(data['error'])
+        return
+
+    st.success("✅ Research complete — review below, then save it to Pending Approvals.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write(f"**Company:** {data.get('company') or 'Unknown'}")
+        st.write(f"**Role:** {data.get('role') or 'Unknown'}")
+        st.write(f"**Location:** {data.get('location') or 'Unknown'}")
+    with col2:
+        st.write(f"**Contact:** {data.get('contact_name') or 'Unknown'}")
+        st.write(f"**Title:** {data.get('contact_title') or 'Unknown'}")
+
+    if data.get('role_summary'):
+        with st.expander("What the role focuses on"):
+            st.write(data['role_summary'])
+
+    # Contact email — always flag for verification.
+    email_addr = (data.get('contact_email') or '').strip()
+    confidence = (data.get('email_confidence') or 'unknown').lower()
+    st.subheader("📇 Contact email")
+    if email_addr:
+        badge = {'published': '🟢 published on a public source',
+                 'inferred': '🟡 inferred from the company email pattern',
+                 'unknown': '⚪ uncertain'}.get(confidence, '⚪ uncertain')
+        st.write(f"**{email_addr}**  —  {badge}")
+        if data.get('email_source'):
+            st.caption(f"Source: {data['email_source']}")
+        st.warning("⚠️ Always verify this address before sending — AI-found emails can be wrong.")
+    else:
+        st.warning("No contact email found. You can add one yourself before sending.")
+
+    if data.get('notes'):
+        st.info(f"**Worth checking:** {data['notes']}")
+
+    st.subheader("📧 Drafted email")
+    st.text_input("Subject", value=data.get('subject', ''), disabled=True, key="research_subj")
+    st.text_area("Email", value=data.get('body', ''), height=320, disabled=True, key="research_body")
+
+    if st.button("💾 Save to Pending Approvals", type="primary"):
+        lead_id = create_lead({
+            'company_name': data.get('company'),
+            'company_domain': None,
+            'company_website': None,
+            'job_title': data.get('role'),
+            'job_url': job_input.strip()[:500],
+            'job_description': data.get('role_summary'),
+            'date_discovered': ist_now().isoformat(),
+            'outreach_subject': data.get('subject'),
+            'outreach_email': data.get('body'),
+            'lead_fit_score': None,
+            'fit_score_reasons': None,
+            'status': 'DRAFT_READY',
+        })
+        update_lead(lead_id, {
+            'contact_name': data.get('contact_name'),
+            'contact_title': data.get('contact_title'),
+            'contact_email': email_addr or None,
+        })
+        log_audit(lead_id, 'LEAD_RESEARCHED', actor='USER',
+                  details=f"Contact: {data.get('contact_name')} <{email_addr}> ({confidence})")
+        log_audit(lead_id, 'EMAIL_DRAFTED', actor='SYSTEM', details='AI web research')
+        st.session_state.last_research = None
+        st.session_state.flash = "✅ Saved to Pending Approvals — review and approve it there."
+        st.session_state.current_page = "approvals"
+        st.rerun()
+
 def page_approval_queue():
     """Page: Review and approve pending emails (max 20 per day)."""
     st.header("⏳ Pending Approvals")
@@ -341,20 +445,26 @@ def page_approval_queue():
     approval_states = {}
 
     for lead in pending:
+        score_txt = f" (Score: {lead['lead_fit_score']}/100)" if lead['lead_fit_score'] is not None else ""
         header = (f"{lead['company_name'] or 'Unknown company'} — "
-                  f"{lead['job_title'] or 'Unknown role'} "
-                  f"(Score: {lead['lead_fit_score'] or 0}/100)")
+                  f"{lead['job_title'] or 'Unknown role'}{score_txt}")
         with st.expander(header):
             col1, col2 = st.columns([1, 3])
 
             with col1:
-                st.metric("Score", f"{lead['lead_fit_score'] or 0}/100")
+                if lead['lead_fit_score'] is not None:
+                    st.metric("Score", f"{lead['lead_fit_score']}/100")
                 approval_states[lead['lead_id']] = st.checkbox(
                     "Approve",
                     key=f"approve_{lead['lead_id']}"
                 )
 
             with col2:
+                if lead['contact_name'] or lead['contact_email']:
+                    to_line = lead['contact_name'] or ''
+                    if lead['contact_email']:
+                        to_line += f" <{lead['contact_email']}>"
+                    st.write(f"**To:** {to_line.strip()}")
                 st.text_input("Subject", value=lead['outreach_subject'] or '',
                               disabled=True, key=f"subj_{lead['lead_id']}")
                 st.text_area("Email", value=lead['outreach_email'] or '',
@@ -449,9 +559,16 @@ def page_review_email():
 
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Fit Score", f"{lead['lead_fit_score'] or 0}/100")
-    with col2:
+        if lead['lead_fit_score'] is not None:
+            st.metric("Fit Score", f"{lead['lead_fit_score']}/100")
         st.write(f"**Status:** {lead['status']}")
+    with col2:
+        if lead['contact_name'] or lead['contact_email']:
+            st.write(f"**Contact:** {lead['contact_name'] or '—'}"
+                     f"{' (' + lead['contact_title'] + ')' if lead['contact_title'] else ''}")
+            if lead['contact_email']:
+                st.write(f"**Email:** {lead['contact_email']}")
+                st.caption("⚠️ Verify this address before sending.")
         st.write(f"**Job URL:** {lead['job_url']}")
 
     if lead['status'] in ('DRAFT_READY', 'APPROVED'):
@@ -483,7 +600,8 @@ def page_review_email():
                     st.caption(f"Daily limit of {DAILY_APPROVAL_LIMIT} approvals reached — "
                                "try again tomorrow.")
         else:
-            contact_email = st.text_input("Recipient email (optional, saved for your records)",
+            contact_email = st.text_input("Recipient email (verify before sending)",
+                                          value=lead['contact_email'] or '',
                                           placeholder="name@company.com")
             with col1:
                 if st.button("✅ Mark as Sent", type="primary"):
@@ -655,12 +773,13 @@ def main():
         page_review_email()
         return
 
-    page_options = ["Discover Lead", "Pending Approvals", "Lead History", "Settings"]
+    page_options = ["Discover Lead", "Research a Job", "Pending Approvals", "Lead History", "Settings"]
     page_index = {
         "discover": 0,
-        "approvals": 1,
-        "leads": 2,
-        "settings": 3
+        "research": 1,
+        "approvals": 2,
+        "leads": 3,
+        "settings": 4
     }.get(st.session_state.current_page, 0)
 
     page = st.sidebar.radio("Navigation", page_options, index=page_index)
@@ -668,6 +787,9 @@ def main():
     if page == "Discover Lead":
         st.session_state.current_page = "discover"
         page_discover_lead()
+    elif page == "Research a Job":
+        st.session_state.current_page = "research"
+        page_research_lead()
     elif page == "Pending Approvals":
         st.session_state.current_page = "approvals"
         page_approval_queue()
