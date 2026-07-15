@@ -119,12 +119,25 @@ def discover_and_save(job_url, actor='SYSTEM', require_design_title=True):
     )
     result['score'] = score_result
 
-    email_result = generate_email(
-        job_title=job_title,
-        job_description=job_description,
-        company_name=company_name or '',
-        recipient_email=None
-    )
+    # Prefer an AI-written, job-specific email; fall back to the template.
+    email_result = None
+    try:
+        from mailer.ai_writer import write_email
+        email_result = write_email(
+            job_title=job_title,
+            job_description=job_description,
+            company_name=company_name or '',
+            recipient_email=None
+        )
+    except Exception:
+        email_result = None
+    if not email_result:
+        email_result = generate_email(
+            job_title=job_title,
+            job_description=job_description,
+            company_name=company_name or '',
+            recipient_email=None
+        )
     result['email'] = email_result
 
     lead_id = create_lead({
@@ -532,6 +545,27 @@ def page_settings():
         st.rerun()
 
     st.divider()
+
+    st.subheader("✍️ Email Writing")
+    try:
+        from mailer.ai_writer import is_ai_available
+        ai_on = is_ai_available()
+    except Exception:
+        ai_on = False
+    if ai_on:
+        st.success("AI writing is **active** — each email is written by Claude, tailored to the "
+                   "specific job post.")
+    else:
+        st.warning("AI writing is **off** — emails use the built-in template. Add an Anthropic API "
+                   "key in the app's Secrets to turn on job-specific AI writing.")
+        with st.expander("How to turn on AI writing"):
+            st.markdown(
+                "1. Get an API key from **console.anthropic.com** (Settings → API Keys).\n"
+                "2. In Streamlit Cloud, open **Manage app → Settings → Secrets**.\n"
+                "3. Add this line and save:\n"
+            )
+            st.code('ANTHROPIC_API_KEY = "sk-ant-..."', language="toml")
+            st.caption("The app restarts automatically and starts writing AI emails on the next run.")
 
     st.subheader("📧 Email Workflow")
     st.info(f"Emails are drafted automatically, you approve up to {DAILY_APPROVAL_LIMIT} per day, "
