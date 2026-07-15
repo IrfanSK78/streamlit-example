@@ -1,167 +1,331 @@
 """Invasive Outreach Agent - Streamlit UI."""
 
 import streamlit as st
-import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from database.db import (
     init_db, create_lead, get_lead, list_leads, update_lead,
-    check_duplicate, check_do_not_contact, log_audit, get_audit_trail, add_do_not_contact
+    check_duplicate, check_do_not_contact, log_audit, get_audit_trail,
+    add_do_not_contact, add_job_source, list_job_sources, remove_job_source,
+    get_state, set_state
 )
 from agents.job_researcher import research_job
 from agents.company_researcher import research_company
 from agents.lead_qualifier import score_lead, explain_score
-from mailer.generator import generate_email, extract_key_themes
-from mailer.gmail_service import send_email, test_connection
+from agents.source_scraper import scrape_source, looks_like_design_job
+from mailer.generator import generate_email
 
 st.set_page_config(page_title="Invasive Outreach Agent", layout="wide")
+
+IST = timezone(timedelta(hours=5, minutes=30))
+DAILY_APPROVAL_LIMIT = 20
+MAX_NEW_LEADS_PER_RUN = 20
+
+DEFAULT_SOURCES = [
+    ('https://weworkremotely.com/categories/remote-design-jobs', 'We Work Remotely - Design'),
+    ('https://remoteok.com/remote-design-jobs', 'RemoteOK - Design'),
+]
+
+def ist_now():
+    """Current time in India Standard Time."""
+    return datetime.now(IST)
+
+def ist_today():
+    """Today's date (India time) as YYYY-MM-DD."""
+    return ist_now().strftime('%Y-%m-%d')
+
+def get_approved_today():
+    """How many emails have been approved today (India time)."""
+    return int(get_state(f'approved_count_{ist_today()}') or 0)
+
+def add_approved_today(count):
+    """Record newly approved emails against today's daily limit."""
+    set_state(f'approved_count_{ist_today()}', str(get_approved_today() + count))
 
 def initialize_session():
     """Initialize session state."""
     if 'initialized' not in st.session_state:
         init_db()
+        if get_state('sources_seeded') is None:
+            for url, label in DEFAULT_SOURCES:
+                add_job_source(url, label)
+            set_state('sources_seeded', '1')
         st.session_state.initialized = True
 
 initialize_session()
 
+def discover_and_save(job_url, actor='SYSTEM', require_design_title=True):
+    """
+    Research one job URL end-to-end: check duplicates, research the job and
+    company, score the lead, draft the email, and save it as DRAFT_READY.
+
+    Returns a dict:
+        lead_id     - new lead id, or None if the job was skipped
+        skip_reason - why the job was skipped (None on success)
+        job / company / score / email - research context when available
+    """
+    result = {'lead_id': None, 'skip_reason': None,
+              'job': None, 'company': None, 'score': None, 'email': None}
+
+    is_dup, dup_info = check_duplicate(job_url=job_url)
+    if is_dup:
+        result['skip_reason'] = f"Already researched (lead {dup_info['lead_id']})"
+        return result
+
+    job = research_job(job_url)
+    result['job'] = job
+    if job['status'] == 'ERROR':
+        result['skip_reason'] = f"Could not read job page: {job['error']}"
+        return result
+
+    job_title = job.get('job_title') or ''
+    job_description = job.get('job_description') or ''
+    company_name = job.get('company_name')
+    company_domain = job.get('company_domain')
+
+    if require_design_title and not looks_like_design_job(job_title):
+        result['skip_reason'] = 'Not a design role'
+        return result
+
+    is_dup, dup_info = check_duplicate(company_domain=company_domain)
+    if is_dup:
+        result['skip_reason'] = f"Company already contacted (lead {dup_info['lead_id']})"
+        return result
+
+    is_dnc, dnc_reason = check_do_not_contact(company_domain=company_domain)
+    if is_dnc:
+        result['skip_reason'] = f'On do-not-contact list: {dnc_reason}'
+        return result
+
+    company = research_company(company_name, company_domain, job_description)
+    result['company'] = company
+
+    score_result = score_lead(
+        job_title=job_title,
+        job_description=job_description,
+        date_posted=None,
+        company_website=company.get('company_website'),
+        date_discovered=datetime.now().isoformat()
+    )
+    result['score'] = score_result
+
+    email_result = generate_email(
+        job_title=job_title,
+        job_description=job_description,
+        company_name=company_name or '',
+        recipient_email=None
+    )
+    result['email'] = email_result
+
+    lead_id = create_lead({
+        'company_name': company_name,
+        'company_domain': company_domain,
+        'company_website': company.get('company_website'),
+        'job_title': job_title,
+        'job_url': job_url,
+        'job_description': job_description,
+        'date_discovered': datetime.now().isoformat(),
+        'outreach_subject': email_result['subject'],
+        'outreach_email': email_result['body'],
+        'lead_fit_score': score_result['score'],
+        'fit_score_reasons': str(score_result['factors']),
+        'status': 'DRAFT_READY'
+    })
+    log_audit(lead_id, 'LEAD_DISCOVERED', actor=actor, details=f'Score: {score_result["score"]}')
+    log_audit(lead_id, 'EMAIL_DRAFTED', actor='SYSTEM', details=f'Subject: {email_result["subject"]}')
+
+    result['lead_id'] = lead_id
+    return result
+
+def run_daily_discovery(force=False):
+    """
+    Once per day (first time the app is opened, India time), search every
+    configured job source for new design jobs and draft outreach emails.
+    """
+    today = ist_today()
+    if not force and get_state('last_run_date') == today:
+        return
+
+    sources = list_job_sources(enabled_only=True)
+    if not sources:
+        if force:
+            st.warning("No job sources configured — add one in Settings first.")
+        return
+
+    set_state('last_run_date', today)
+
+    created = 0
+    skipped = 0
+    failed_sources = 0
+
+    with st.status(f"🌅 Morning run — searching {len(sources)} job source(s) for new design jobs...",
+                   expanded=True) as status:
+        for source in sources:
+            name = source['label'] or source['url']
+            st.write(f"🔎 Searching {name}...")
+
+            scraped = scrape_source(source['url'])
+            if scraped['status'] == 'ERROR':
+                failed_sources += 1
+                st.write(f"⚠️ Could not read {name}: {scraped['error']}")
+                continue
+
+            if not scraped['job_urls']:
+                st.write("No design job links found on this source.")
+                continue
+
+            for job_url in scraped['job_urls']:
+                if created >= MAX_NEW_LEADS_PER_RUN:
+                    break
+                r = discover_and_save(job_url, actor='SYSTEM')
+                if r['lead_id']:
+                    created += 1
+                    job = r['job'] or {}
+                    st.write(f"✉️ Drafted: {job.get('company_name') or 'Unknown company'} — "
+                             f"{job.get('job_title') or 'Unknown role'} (score {r['score']['score']}/100)")
+                else:
+                    skipped += 1
+
+            if created >= MAX_NEW_LEADS_PER_RUN:
+                st.write(f"Reached today's cap of {MAX_NEW_LEADS_PER_RUN} new drafts.")
+                break
+
+        summary = f"{created} new emails drafted, {skipped} jobs skipped"
+        if failed_sources:
+            summary += f", {failed_sources} source(s) unreachable"
+
+        set_state('last_run_time', ist_now().strftime('%d %b %Y, %I:%M %p IST'))
+        set_state('last_run_summary', summary)
+        status.update(label=f"🌅 Morning run complete — {summary}", state="complete", expanded=False)
+
+    if created:
+        st.success(f"🌅 {created} new emails are waiting in **Pending Approvals**.")
+
 def page_discover_lead():
-    """Page: Discover and research a new lead."""
+    """Page: Manually discover and research a new lead."""
     st.header("🔍 Discover Lead")
-    st.write("Paste a job URL to research and qualify a potential lead.")
+    st.write("Paste a job URL to research it and draft an outreach email. "
+             "New design jobs are also discovered automatically every morning.")
 
-    col1, col2 = st.columns([3, 1])
+    job_url = st.text_input("Job URL", placeholder="https://jobs.company.com/job/123")
 
-    with col1:
-        job_url = st.text_input("Job URL", placeholder="https://jobs.company.com/job/123")
+    if st.button("Research & Draft Email", type="primary") and job_url:
+        with st.spinner("Researching job and drafting email..."):
+            result = discover_and_save(job_url, actor='USER', require_design_title=False)
 
-    with col2:
-        search_button = st.button("Research", type="primary")
-
-    if search_button and job_url:
-        st.info("Researching job posting...")
-
-        job_research = research_job(job_url)
-
-        if job_research['status'] == 'ERROR':
-            st.error(f"Error: {job_research['error']}")
+        if result['skip_reason']:
+            st.warning(f"Skipped: {result['skip_reason']}")
             return
 
-        if job_research['warnings']:
-            with st.warning("Warnings during research"):
-                for warning in job_research['warnings']:
-                    st.write(f"⚠ {warning}")
+        job = result['job']
+        score = result['score']
+        email = result['email']
 
-        st.success("Job research complete")
+        st.success("✅ Email drafted and added to Pending Approvals")
 
-        company_name = job_research.get('company_name')
-        company_domain = job_research.get('company_domain')
-
-        st.subheader("Job Information")
         col1, col2 = st.columns(2)
         with col1:
-            st.write(f"**Job Title:** {job_research['job_title'] or 'Unknown'}")
-            st.write(f"**Company:** {company_name or 'Unknown'}")
+            st.write(f"**Job Title:** {job.get('job_title') or 'Unknown'}")
+            st.write(f"**Company:** {job.get('company_name') or 'Unknown'}")
         with col2:
-            st.write(f"**Domain:** {company_domain or 'Unknown'}")
-            st.write(f"**URL:** {job_url}")
+            st.metric("Lead Fit Score", f"{score['score']}/100", score['recommendation'])
 
-        if job_research['job_description']:
-            with st.expander("View job description"):
-                st.text_area("Job Description", job_research['job_description'], height=200, disabled=True)
+        with st.expander("Scoring details"):
+            st.write(explain_score(score))
 
-        st.subheader("Company Research")
+        if job.get('job_description'):
+            with st.expander("Job description"):
+                st.text(job['job_description'][:3000])
 
-        company_research = research_company(company_name, company_domain, job_research['job_description'])
+        st.text_input("Subject", value=email['subject'], disabled=True)
+        st.text_area("Email Body", value=email['body'], height=280, disabled=True)
 
-        if company_research['status'] == 'ERROR':
-            st.warning(f"Could not research company: {company_research['error']}")
-        else:
-            st.write(f"**Website:** {company_research['company_website']}")
+        st.info("Go to **Pending Approvals** in the sidebar to approve it.")
 
-            if company_research['complexity_observations']:
-                st.write("**Website Observations:**")
-                for obs in company_research['complexity_observations']:
-                    st.write(f"  • {obs}")
+def page_approval_queue():
+    """Page: Review and approve pending emails (max 20 per day)."""
+    st.header("⏳ Pending Approvals")
 
-        st.subheader("Lead Qualification")
+    approved_today = get_approved_today()
+    remaining_today = max(0, DAILY_APPROVAL_LIMIT - approved_today)
 
-        score_result = score_lead(
-            job_title=job_research['job_title'] or '',
-            job_description=job_research['job_description'] or '',
-            date_posted=None,
-            company_website=company_research.get('company_website'),
-            date_discovered=datetime.now().isoformat()
-        )
+    pending = list_leads(status='DRAFT_READY', limit=100)
 
-        st.metric("Lead Fit Score", score_result['score'], f"{score_result['recommendation']}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Waiting for approval", len(pending))
+    col2.metric("Approved today", f"{approved_today}/{DAILY_APPROVAL_LIMIT}")
+    col3.metric("Approvals left today", remaining_today)
 
-        with st.expander("Scoring Details"):
-            st.write(explain_score(score_result))
+    if not pending:
+        st.info("✅ No pending emails. All caught up!")
+        return
 
-        is_dup, dup_info = check_duplicate(
-            job_url=job_url,
-            company_domain=company_domain
-        )
+    if remaining_today == 0:
+        st.error(f"🚫 Daily limit of {DAILY_APPROVAL_LIMIT} approvals reached. "
+                 "More approvals unlock tomorrow (India time).")
 
-        if is_dup:
-            if dup_info['type'] == 'COMPANY_CONTACTED':
-                st.error(f"❌ Company already contacted: {dup_info['lead_id']} (Status: {dup_info['status']})")
+    st.divider()
+
+    approval_states = {}
+
+    for lead in pending:
+        header = (f"{lead['company_name'] or 'Unknown company'} — "
+                  f"{lead['job_title'] or 'Unknown role'} "
+                  f"(Score: {lead['lead_fit_score'] or 0}/100)")
+        with st.expander(header):
+            col1, col2 = st.columns([1, 3])
+
+            with col1:
+                st.metric("Score", f"{lead['lead_fit_score'] or 0}/100")
+                approval_states[lead['lead_id']] = st.checkbox(
+                    "Approve",
+                    key=f"approve_{lead['lead_id']}"
+                )
+
+            with col2:
+                st.text_input("Subject", value=lead['outreach_subject'] or '',
+                              disabled=True, key=f"subj_{lead['lead_id']}")
+                st.text_area("Email", value=lead['outreach_email'] or '',
+                             height=200, disabled=True, key=f"body_{lead['lead_id']}")
+
+    st.divider()
+
+    def approve_leads(lead_ids):
+        to_approve = lead_ids[:remaining_today]
+        for lead_id in to_approve:
+            update_lead(lead_id, {'status': 'APPROVED'})
+            log_audit(lead_id, 'EMAIL_APPROVED', actor='USER', details='Approved for sending')
+        add_approved_today(len(to_approve))
+
+        st.session_state.flash = (f"✅ {len(to_approve)} email(s) approved — "
+                                  "open them in Lead History to copy and send from Gmail.")
+        overflow = len(lead_ids) - len(to_approve)
+        if overflow > 0:
+            st.session_state.flash_warning = (f"Daily limit of {DAILY_APPROVAL_LIMIT} reached: "
+                                              f"{overflow} email(s) stay pending until tomorrow.")
+        st.rerun()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("✅ Approve Selected", type="primary", disabled=remaining_today == 0):
+            selected = [lead_id for lead_id, approved in approval_states.items() if approved]
+            if not selected:
+                st.warning("Tick 'Approve' on the emails you want first.")
             else:
-                st.warning(f"⚠️ This job was already researched: {dup_info['lead_id']}")
-        else:
-            is_dnc, dnc_reason = check_do_not_contact(company_domain=company_domain)
-            if is_dnc:
-                st.error(f"❌ Company is on do-not-contact list: {dnc_reason}")
-            else:
-                with st.spinner("Generating personalized email..."):
-                    themes = extract_key_themes(job_research['job_description'] or '')
-                    email_result = generate_email(
-                        job_title=job_research['job_title'] or '',
-                        company_name=company_name or '',
-                        themes=themes,
-                        job_description=job_research['job_description'] or ''
-                    )
+                approve_leads(selected)
 
-                    subject_line = email_result.get('subject', 'Design Opportunity at ' + (company_name or 'Your Company'))
-                    email_body = email_result.get('body', '')
-
-                    lead_data = {
-                        'company_name': company_name,
-                        'company_domain': company_domain,
-                        'company_website': company_research.get('company_website'),
-                        'job_title': job_research['job_title'],
-                        'job_url': job_url,
-                        'job_description': job_research['job_description'],
-                        'date_discovered': datetime.now().isoformat(),
-                        'outreach_subject': subject_line,
-                        'outreach_email': email_body,
-                        'status': 'DRAFT_READY'
-                    }
-
-                    lead_id = create_lead(lead_data)
-                    log_audit(lead_id, 'LEAD_DISCOVERED', actor='SYSTEM', details=f'Score: {score_result["score"]}')
-
-                    update_lead(lead_id, {
-                        'lead_fit_score': score_result['score'],
-                        'fit_score_reasons': str(score_result['factors'])
-                    })
-
-                    st.subheader("📧 Email Generated")
-                    st.text_input("Subject", value=subject_line, disabled=True)
-                    st.text_area("Email Body", value=email_body, height=300, disabled=True)
-
-                    st.info("✅ Email saved to Approval Queue. Go to 'Pending Approvals' to review and send.")
-
-                    if st.button("📋 Go to Approval Queue", type="primary"):
-                        st.session_state.current_page = "approvals"
-                        st.rerun()
+    with col2:
+        approvable = min(len(pending), remaining_today)
+        if st.button(f"✅ Approve All ({approvable})", disabled=remaining_today == 0):
+            approve_leads([lead['lead_id'] for lead in pending])
 
 def page_leads_list():
     """Page: View all leads."""
     st.header("📋 Lead History")
 
     status_filter = st.selectbox("Filter by status", ["ALL"] + [
-        'DISCOVERED', 'RESEARCHING', 'QUALIFIED', 'NOT_QUALIFIED',
-        'DRAFT_READY', 'AWAITING_APPROVAL', 'CONTACTED', 'REPLIED'
+        'DRAFT_READY', 'APPROVED', 'CONTACTED', 'REPLIED',
+        'NOT_QUALIFIED', 'DISCOVERED'
     ])
 
     leads = list_leads(status=None if status_filter == "ALL" else status_filter, limit=100)
@@ -171,32 +335,32 @@ def page_leads_list():
         return
 
     for lead in leads:
-        with st.expander(f"{lead['company_name']} - {lead['job_title']} ({lead['lead_id']})"):
+        header = (f"{lead['company_name'] or 'Unknown company'} — "
+                  f"{lead['job_title'] or 'Unknown role'} · {lead['status']}")
+        with st.expander(header):
             col1, col2 = st.columns(2)
 
             with col1:
                 st.write(f"**Status:** {lead['status']}")
                 st.write(f"**Score:** {lead['lead_fit_score'] or 'N/A'}/100")
-                st.write(f"**Country:** {lead['country'] or 'Unknown'}")
 
             with col2:
                 st.write(f"**URL:** {lead['job_url']}")
                 st.write(f"**Discovered:** {lead['date_discovered']}")
 
-            if lead['contact_name']:
-                st.write(f"**Contact:** {lead['contact_name']} ({lead['contact_title']})")
-
-            if lead['status'] == 'DRAFT_READY' or lead['status'] == 'AWAITING_APPROVAL':
-                if st.button(f"Review Email - {lead['lead_id']}", key=f"review_{lead['lead_id']}"):
-                    st.session_state.current_lead_id = lead['lead_id']
-                    st.session_state.current_page = "review_email"
-                    st.rerun()
+            if lead['contact_email']:
+                st.write(f"**Contact:** {lead['contact_email']}")
 
             if lead['status'] == 'CONTACTED':
-                st.write(f"**Contacted:** {lead['date_contacted']}")
+                st.write(f"**Sent:** {lead['date_contacted']}")
+
+            if st.button(f"Open email", key=f"open_{lead['lead_id']}"):
+                st.session_state.current_lead_id = lead['lead_id']
+                st.session_state.current_page = "review_email"
+                st.rerun()
 
 def page_review_email():
-    """Page: Review sent emails."""
+    """Page: View one email, copy it, and mark it as sent."""
     st.header("📧 Email Review")
 
     lead_id = st.session_state.get('current_lead_id')
@@ -209,26 +373,60 @@ def page_review_email():
         st.error(f"Lead not found: {lead_id}")
         return
 
-    st.subheader(f"{lead['company_name']} - {lead['job_title']}")
+    st.subheader(f"{lead['company_name'] or 'Unknown company'} — {lead['job_title'] or 'Unknown role'}")
 
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Lead ID", lead_id)
-        st.metric("Fit Score", f"{lead['lead_fit_score']}/100")
+        st.metric("Fit Score", f"{lead['lead_fit_score'] or 0}/100")
     with col2:
         st.write(f"**Status:** {lead['status']}")
-        if lead['date_contacted']:
-            st.write(f"**Sent:** {lead['date_contacted']}")
+        st.write(f"**Job URL:** {lead['job_url']}")
 
-    st.subheader("Email Content")
+    if lead['status'] in ('DRAFT_READY', 'APPROVED'):
+        st.subheader("Copy & send from your Gmail")
+        st.caption("Tap the copy icon in the corner of each box, paste into a new Gmail message, "
+                   "then come back and mark it as sent.")
 
-    if lead['contact_email']:
-        st.write(f"**To:** {lead['contact_email']}")
+        st.write("**Subject:**")
+        st.code(lead['outreach_subject'] or '', language=None)
+        st.write("**Email body:**")
+        st.code(lead['outreach_email'] or '', language=None)
+
+        contact_email = st.text_input("Recipient email (optional, saved for your records)",
+                                      placeholder="name@company.com")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Mark as Sent", type="primary"):
+                updates = {'status': 'CONTACTED', 'date_contacted': datetime.now().isoformat()}
+                if contact_email:
+                    updates['contact_email'] = contact_email
+                update_lead(lead_id, updates)
+                details = 'Sent manually from Gmail'
+                if contact_email:
+                    details += f' to {contact_email}'
+                log_audit(lead_id, 'EMAIL_SENT', actor='USER', details=details)
+                st.session_state.flash = "✅ Marked as sent."
+                st.rerun()
+        with col2:
+            if st.button("❌ Mark as Not Qualified"):
+                update_lead(lead_id, {'status': 'NOT_QUALIFIED'})
+                log_audit(lead_id, 'REJECTED_BY_USER', actor='USER')
+                st.session_state.flash = "Lead marked as not qualified."
+                st.session_state.current_page = "leads"
+                st.session_state.current_lead_id = None
+                st.rerun()
+
+    elif lead['status'] == 'CONTACTED':
+        st.info(f"✅ Sent on {lead['date_contacted']}")
+        st.write("**Subject:**")
+        st.code(lead['outreach_subject'] or '', language=None)
+        st.write("**Email body:**")
+        st.code(lead['outreach_email'] or '', language=None)
+
     else:
-        st.warning("No contact email on file")
-
-    st.text_input("Subject", value=lead['outreach_subject'] or '', disabled=True)
-    st.text_area("Email Body", value=lead['outreach_email'] or '', height=400, disabled=True)
+        st.text_input("Subject", value=lead['outreach_subject'] or '', disabled=True)
+        st.text_area("Email Body", value=lead['outreach_email'] or '', height=300, disabled=True)
 
     audit_trail = get_audit_trail(lead_id)
     if audit_trail:
@@ -238,61 +436,58 @@ def page_review_email():
                 if entry['details']:
                     st.write(f"  {entry['details']}")
 
-    st.divider()
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if lead['status'] == 'DRAFT_READY':
-            contact_email = st.text_input("Contact Email", placeholder="Enter recipient email to send")
-            if st.button("✉️ Send Draft Email", type="primary"):
-                if not contact_email:
-                    st.error("Please enter contact email")
-                else:
-                    with st.spinner("Sending email..."):
-                        result = send_email(
-                            recipient_email=contact_email,
-                            subject_line=lead['outreach_subject'],
-                            email_body=lead['outreach_email'],
-                            sender_email="sonia.baig@invasived.com"
-                        )
-
-                        if result['success']:
-                            update_lead(lead_id, {
-                                'status': 'CONTACTED',
-                                'date_contacted': datetime.now().isoformat(),
-                                'contact_email': contact_email
-                            })
-
-                            log_audit(
-                                lead_id,
-                                'EMAIL_SENT',
-                                actor='USER',
-                                details=f"To: {contact_email}, Message ID: {result['message_id']}"
-                            )
-
-                            st.success("✅ Email sent!")
-                            st.rerun()
-                        else:
-                            st.error(f"Failed to send: {result['error']}")
-        else:
-            st.info(f"✅ Email sent on {lead['date_contacted']}")
-
-    with col2:
-        if st.button("❌ Mark as Not Qualified"):
-            update_lead(lead_id, {'status': 'NOT_QUALIFIED'})
-            log_audit(lead_id, 'REJECTED_BY_USER', actor='USER')
-            st.success("Lead rejected")
-            st.session_state.current_lead_id = None
-            st.rerun()
-
 def page_settings():
     """Page: Settings and configuration."""
     st.header("⚙️ Settings")
 
-    st.info("📧 **Email Workflow**: Generated emails are copied manually and sent from your Gmail inbox.")
+    st.subheader("🌅 Morning Run — Job Sources")
+    st.write("The first time you open the app each day (India time), it automatically searches "
+             "these pages for new design jobs and drafts outreach emails for your approval.")
 
-    st.subheader("Database")
+    last_run = get_state('last_run_time')
+    last_summary = get_state('last_run_summary')
+    if last_run:
+        st.info(f"Last run: {last_run} — {last_summary or ''}")
+
+    sources = list_job_sources()
+    if not sources:
+        st.warning("No job sources configured. Add one below to enable the morning run.")
+
+    for source in sources:
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.write(f"**{source['label'] or 'Job source'}**  \n{source['url']}")
+        with col2:
+            if st.button("Remove", key=f"rm_src_{source['source_id']}"):
+                remove_job_source(source['source_id'])
+                st.rerun()
+
+    with st.form("add_source_form", clear_on_submit=True):
+        new_label = st.text_input("Name (optional)", placeholder="e.g. Dribbble Jobs")
+        new_url = st.text_input("Job board page URL", placeholder="https://...")
+        if st.form_submit_button("➕ Add Source"):
+            if new_url.strip():
+                if add_job_source(new_url.strip(), new_label.strip() or None):
+                    st.success("Source added — it will be searched on the next run.")
+                else:
+                    st.warning("That URL is already in the list.")
+                st.rerun()
+            else:
+                st.error("Please enter a URL.")
+
+    if st.button("▶️ Run morning discovery now", type="primary"):
+        st.session_state.force_run = True
+        st.rerun()
+
+    st.divider()
+
+    st.subheader("📧 Email Workflow")
+    st.info(f"Emails are drafted automatically, you approve up to {DAILY_APPROVAL_LIMIT} per day, "
+            "then copy each one into Gmail to send.")
+
+    st.subheader("💾 Database")
+    st.caption("Streamlit Cloud storage can reset when the app restarts — "
+               "export your leads to CSV regularly as a backup.")
 
     if st.button("Export Leads to CSV"):
         from database.db import export_to_csv
@@ -308,71 +503,8 @@ def page_settings():
                 file_name="leads_export.csv",
                 mime="text/csv"
             )
-
-def page_approval_queue():
-    """Page: Review and approve pending emails."""
-    st.header("⏳ Pending Approvals")
-
-    pending = list_leads(status='DRAFT_READY', limit=100)
-
-    if not pending:
-        st.info("✅ No pending emails. All caught up!")
-        return
-
-    st.write(f"**{len(pending)} emails waiting for approval**")
-    st.divider()
-
-    approval_states = {}
-
-    for lead in pending:
-        with st.expander(f"🔍 {lead['company_name']} - {lead['job_title']} (Score: {lead['lead_fit_score']}/100)"):
-            col1, col2 = st.columns([1, 3])
-
-            with col1:
-                st.metric("Score", f"{lead['lead_fit_score']}/100")
-                approval_states[lead['lead_id']] = st.checkbox(
-                    "Approve",
-                    key=f"approve_{lead['lead_id']}"
-                )
-
-            with col2:
-                st.write(f"**To:** Contact email")
-                st.text_input("Subject", value=lead['outreach_subject'], disabled=True, key=f"subj_{lead['lead_id']}")
-                st.text_area("Email", value=lead['outreach_email'], height=200, disabled=True, key=f"body_{lead['lead_id']}")
-
-    st.divider()
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        if st.button("✅ Approve Selected", type="primary"):
-            approved_leads = [lead_id for lead_id, approved in approval_states.items() if approved]
-
-            if not approved_leads:
-                st.warning("Please select emails to approve")
-            else:
-                for lead_id in approved_leads:
-                    update_lead(lead_id, {'status': 'APPROVED'})
-                    log_audit(lead_id, 'EMAIL_APPROVED', actor='USER', details='Ready to send')
-
-                st.success(f"✅ {len(approved_leads)} emails approved and ready to send!")
-                st.balloons()
-                st.rerun()
-
-    with col2:
-        if st.button("✅ Approve All"):
-            for lead in pending:
-                update_lead(lead['lead_id'], {'status': 'APPROVED'})
-                log_audit(lead['lead_id'], 'EMAIL_APPROVED', actor='USER', details='Ready to send')
-
-            st.success(f"✅ All {len(pending)} emails approved!")
-            st.balloons()
-            st.rerun()
-
-    with col3:
-        if st.button("📋 View Approved"):
-            st.session_state.current_page = "leads"
-            st.rerun()
+        else:
+            st.info("No leads to export yet.")
 
 def main():
     """Main app."""
@@ -380,6 +512,31 @@ def main():
 
     if 'current_page' not in st.session_state:
         st.session_state.current_page = "discover"
+
+    pending_count = len(list_leads(status='DRAFT_READY', limit=100))
+    st.sidebar.caption(f"⏳ {pending_count} pending · "
+                       f"✅ {get_approved_today()}/{DAILY_APPROVAL_LIMIT} approved today")
+    last_run = get_state('last_run_time')
+    if last_run:
+        st.sidebar.caption(f"🌅 Last morning run: {last_run}")
+
+    force_run = st.session_state.pop('force_run', False)
+    run_daily_discovery(force=force_run)
+
+    flash = st.session_state.pop('flash', None)
+    if flash:
+        st.success(flash)
+    flash_warning = st.session_state.pop('flash_warning', None)
+    if flash_warning:
+        st.warning(flash_warning)
+
+    if st.session_state.current_page == "review_email" and st.session_state.get('current_lead_id'):
+        if st.sidebar.button("⬅ Back to Lead History"):
+            st.session_state.current_page = "leads"
+            st.session_state.current_lead_id = None
+            st.rerun()
+        page_review_email()
+        return
 
     page_options = ["Discover Lead", "Pending Approvals", "Lead History", "Settings"]
     page_index = {

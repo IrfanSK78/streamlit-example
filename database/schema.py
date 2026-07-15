@@ -53,5 +53,23 @@ def create_tables(db_path='leads.db'):
         )
     ''')
 
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS job_sources (
+            source_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE,
+            label TEXT,
+            enabled INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS app_state (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     conn.commit()
     conn.close()

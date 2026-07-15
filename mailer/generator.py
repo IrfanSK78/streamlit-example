@@ -34,20 +34,22 @@ def generate_email(job_title, job_description, company_name, recipient_email):
 
 def generate_subject(job_title, company_name, themes):
     """Generate personalized subject line."""
+    target = company_name or 'your team'
     if 'design_systems' in themes:
-        return f"Design systems expertise for {company_name}"
+        return f"Design systems expertise for {target}"
     elif 'research_focus' in themes:
-        return f"UX research partnership idea - {company_name}"
+        return f"UX research partnership idea - {target}"
     elif 'transformation' in themes:
-        return f"Supporting {company_name}'s design transformation"
+        return f"Supporting {target}'s design transformation" if company_name else "Supporting your design transformation"
     elif 'underresourced' in themes:
-        return f"Design support for {company_name}'s growth"
+        return f"Design support for {target}'s growth" if company_name else "Design support as you grow"
     else:
-        return f"Design partnership opportunity - {company_name}"
+        return f"Design partnership opportunity - {target}" if company_name else "Design partnership opportunity"
 
 def generate_body(job_title, company_name, job_description, themes):
     """Generate personalized email body."""
-    opening = f"I came across your {job_title} opening at {company_name} and was impressed by the focus on user-centered design."
+    where = f" at {company_name}" if company_name else ""
+    opening = f"I came across your {job_title} opening{where} and was impressed by the focus on user-centered design."
     if 'underresourced' in themes:
         value_prop = "We specialize in partnering with companies to scale design capabilities without adding permanent headcount."
     elif 'design_systems' in themes:

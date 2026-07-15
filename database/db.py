@@ -20,11 +20,15 @@ def create_lead(data):
     cursor.execute('''
         INSERT INTO leads (
             lead_id, company_name, company_domain, company_website,
-            job_title, job_url, job_description, date_discovered, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            job_title, job_url, job_description, date_discovered,
+            outreach_subject, outreach_email, lead_fit_score, fit_score_reasons, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (lead_id, data.get('company_name'), data.get('company_domain'),
           data.get('company_website'), data.get('job_title'), data.get('job_url'),
-          data.get('job_description'), data.get('date_discovered'), 'DISCOVERED'))
+          data.get('job_description'), data.get('date_discovered'),
+          data.get('outreach_subject'), data.get('outreach_email'),
+          data.get('lead_fit_score'), data.get('fit_score_reasons'),
+          data.get('status', 'DISCOVERED')))
     conn.commit()
     conn.close()
     return lead_id
@@ -128,6 +132,62 @@ def get_audit_trail(lead_id):
     entries = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return entries
+
+def add_job_source(url, label=None):
+    """Add a job source page URL that the daily run searches for new jobs."""
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO job_sources (url, label) VALUES (?, ?)', (url, label))
+    conn.commit()
+    added = cursor.rowcount > 0
+    conn.close()
+    return added
+
+def list_job_sources(enabled_only=False):
+    """List configured job source pages."""
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if enabled_only:
+        cursor.execute('SELECT * FROM job_sources WHERE enabled = 1 ORDER BY source_id')
+    else:
+        cursor.execute('SELECT * FROM job_sources ORDER BY source_id')
+    sources = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return sources
+
+def remove_job_source(source_id):
+    """Remove a job source."""
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM job_sources WHERE source_id = ?', (source_id,))
+    conn.commit()
+    conn.close()
+
+def get_state(key):
+    """Read a value from the app_state key-value store."""
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT value FROM app_state WHERE key = ?', (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def set_state(key, value):
+    """Write a value to the app_state key-value store."""
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+    ''', (key, str(value)))
+    conn.commit()
+    conn.close()
 
 def export_to_csv(filepath='leads_export.csv'):
     """Export leads to CSV."""
