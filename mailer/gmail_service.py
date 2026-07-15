@@ -41,6 +41,16 @@ def _load_google_api():
         logger.warning(f"Google API not available: {e}")
         return False
 
+def _get_streamlit_secrets():
+    """Get credentials from Streamlit secrets (for cloud deployment)."""
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets') and 'google_oauth' in st.secrets:
+            return st.secrets['google_oauth']
+    except:
+        pass
+    return None
+
 def get_credentials():
     """Get valid Google credentials for Gmail."""
     if not _load_google_api():
@@ -57,7 +67,12 @@ def get_credentials():
             creds.refresh(Request())
         else:
             if not os.path.exists(CREDENTIALS_FILE):
-                logger.error(f"Credentials file not found: {CREDENTIALS_FILE}")
+                streamlit_secrets = _get_streamlit_secrets()
+                if not streamlit_secrets:
+                    logger.error(f"Credentials file not found: {CREDENTIALS_FILE}")
+                    return None
+
+                logger.info("Using Streamlit secrets for OAuth")
                 return None
 
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
