@@ -17,9 +17,10 @@ HEADERS = {
 # hiring company's domain, so company info must come from the page content.
 KNOWN_JOB_BOARDS = {
     'weworkremotely.com', 'remoteok.com', 'remoteok.io', 'remote.co',
-    'indeed.com', 'linkedin.com', 'glassdoor.com', 'wellfound.com',
-    'dribbble.com', 'behance.net', 'monster.com', 'ziprecruiter.com',
-    'workingnomads.com', 'jobspresso.co', 'dynamitejobs.com',
+    'remotive.com', 'remotive.io', 'indeed.com', 'linkedin.com', 'glassdoor.com',
+    'wellfound.com', 'angel.co', 'dribbble.com', 'behance.net', 'monster.com',
+    'ziprecruiter.com', 'workingnomads.com', 'jobspresso.co', 'dynamitejobs.com',
+    'himalayas.app', 'authenticjobs.com', 'builtin.com', 'otta.com',
 }
 
 def is_job_board(domain):
