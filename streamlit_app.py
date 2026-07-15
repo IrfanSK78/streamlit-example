@@ -14,6 +14,7 @@ from agents.company_researcher import research_company
 from agents.lead_qualifier import score_lead, explain_score
 from agents.source_scraper import scrape_source, looks_like_design_job, fetch_structured_jobs
 from mailer.generator import generate_email, clean_job_title
+from mailer.sender import is_sending_enabled, send_email, sender_address
 
 st.set_page_config(page_title="Invasive Outreach Agent", layout="wide")
 
@@ -422,6 +423,9 @@ def page_approval_queue():
     """Page: Review and approve pending emails (max 20 per day)."""
     st.header("⏳ Pending Approvals")
 
+    sending_on = is_sending_enabled()
+    verb = "Sent" if sending_on else "Approved"
+
     approved_today = get_approved_today()
     remaining_today = max(0, DAILY_APPROVAL_LIMIT - approved_today)
 
@@ -429,16 +433,23 @@ def page_approval_queue():
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Waiting for approval", len(pending))
-    col2.metric("Approved today", f"{approved_today}/{DAILY_APPROVAL_LIMIT}")
-    col3.metric("Approvals left today", remaining_today)
+    col2.metric(f"{verb} today", f"{approved_today}/{DAILY_APPROVAL_LIMIT}")
+    col3.metric("Left today", remaining_today)
+
+    if sending_on:
+        st.success(f"📤 Sending is ON — approving sends the email from **{sender_address()}** "
+                   "(up to 20/day). Recipients without an email address are skipped.")
+    else:
+        st.info("📮 Sending is off — approving marks emails ready to copy into Gmail. "
+                "Turn on automatic sending in **Settings**.")
 
     if not pending:
         st.info("✅ No pending emails. All caught up!")
         return
 
     if remaining_today == 0:
-        st.error(f"🚫 Daily limit of {DAILY_APPROVAL_LIMIT} approvals reached. "
-                 "More approvals unlock tomorrow (India time).")
+        st.error(f"🚫 Daily limit of {DAILY_APPROVAL_LIMIT} reached. "
+                 "More unlock tomorrow (India time).")
 
     st.divider()
 
@@ -473,24 +484,61 @@ def page_approval_queue():
     st.divider()
 
     def approve_leads(lead_ids):
-        to_approve = lead_ids[:remaining_today]
-        for lead_id in to_approve:
-            update_lead(lead_id, {'status': 'APPROVED'})
-            log_audit(lead_id, 'EMAIL_APPROVED', actor='USER', details='Approved for sending')
-        add_approved_today(len(to_approve))
+        selected = lead_ids[:remaining_today]
+        sent = 0
+        approved = 0
+        errors = []
+        for lead_id in selected:
+            lead = get_lead(lead_id)
+            if not lead:
+                continue
+            if sending_on:
+                to_email = (lead['contact_email'] or '').strip()
+                if not to_email:
+                    # Nothing to send to — mark ready for manual sending instead.
+                    update_lead(lead_id, {'status': 'APPROVED'})
+                    log_audit(lead_id, 'EMAIL_APPROVED', actor='USER',
+                              details='Approved (no recipient email — manual send)')
+                    approved += 1
+                    continue
+                result = send_email(to_email, lead['outreach_subject'], lead['outreach_email'])
+                if result['ok']:
+                    update_lead(lead_id, {'status': 'CONTACTED',
+                                          'date_contacted': ist_now().isoformat()})
+                    log_audit(lead_id, 'EMAIL_SENT', actor='USER',
+                              details=f'Sent to {to_email} via SMTP')
+                    sent += 1
+                else:
+                    log_audit(lead_id, 'SEND_FAILED', actor='SYSTEM', details=result['error'])
+                    errors.append(f"{lead['company_name'] or 'lead'}: {result['error']}")
+            else:
+                update_lead(lead_id, {'status': 'APPROVED'})
+                log_audit(lead_id, 'EMAIL_APPROVED', actor='USER', details='Approved for sending')
+                approved += 1
 
-        st.session_state.flash = (f"✅ {len(to_approve)} email(s) approved — "
-                                  "open them in Lead History to copy and send from Gmail.")
-        overflow = len(lead_ids) - len(to_approve)
+        # Only count what actually completed against the daily limit.
+        add_approved_today(sent + approved)
+
+        parts = []
+        if sent:
+            parts.append(f"📤 {sent} email(s) sent")
+        if approved:
+            parts.append(f"✅ {approved} approved (no email address — send manually)")
+        st.session_state.flash = " · ".join(parts) if parts else "Nothing to do."
+        if errors:
+            st.session_state.flash_warning = "Some did not send: " + "; ".join(errors[:5])
+        overflow = len(lead_ids) - len(selected)
         if overflow > 0:
-            st.session_state.flash_warning = (f"Daily limit of {DAILY_APPROVAL_LIMIT} reached: "
-                                              f"{overflow} email(s) stay pending until tomorrow.")
+            prev = st.session_state.get('flash_warning', '')
+            st.session_state.flash_warning = (prev + " " if prev else "") + \
+                f"Daily limit of {DAILY_APPROVAL_LIMIT} reached: {overflow} stay pending until tomorrow."
         st.rerun()
 
+    action = "Approve & Send" if sending_on else "Approve"
     col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("✅ Approve Selected", type="primary", disabled=remaining_today == 0):
+        if st.button(f"✅ {action} Selected", type="primary", disabled=remaining_today == 0):
             selected = [lead_id for lead_id, approved in approval_states.items() if approved]
             if not selected:
                 st.warning("Tick 'Approve' on the emails you want first.")
@@ -499,7 +547,7 @@ def page_approval_queue():
 
     with col2:
         approvable = min(len(pending), remaining_today)
-        if st.button(f"✅ Approve All ({approvable})", disabled=remaining_today == 0):
+        if st.button(f"✅ {action} All ({approvable})", disabled=remaining_today == 0):
             approve_leads([lead['lead_id'] for lead in pending])
 
 def page_leads_list():
@@ -713,9 +761,47 @@ def page_settings():
             st.code('ANTHROPIC_API_KEY = "sk-ant-..."', language="toml")
             st.caption("The app restarts automatically and starts writing AI emails on the next run.")
 
-    st.subheader("📧 Email Workflow")
-    st.info(f"Emails are drafted automatically, you approve up to {DAILY_APPROVAL_LIMIT} per day, "
-            "then copy each one into Gmail to send.")
+    st.subheader("📤 Email Sending")
+    send_on = is_sending_enabled()
+    if send_on:
+        st.success(f"Automatic sending is **on** — approved emails are sent from **{sender_address()}** "
+                   f"(up to {DAILY_APPROVAL_LIMIT}/day).")
+        test_to = st.text_input("Send a test email to yourself first",
+                                placeholder="you@example.com")
+        if st.button("✉️ Send test email"):
+            if not test_to.strip():
+                st.warning("Enter an address to send the test to.")
+            else:
+                with st.spinner("Sending test..."):
+                    res = send_email(test_to.strip(), "Invasive Outreach Agent — test",
+                                     "This is a test from your outreach app. If you received it, "
+                                     "sending is working. — Sonia Baig, Invasive Design")
+                if res['ok']:
+                    st.success(f"✅ Test sent to {test_to.strip()}. Check the inbox (and spam folder).")
+                else:
+                    st.error(f"❌ Could not send: {res['error']}")
+    else:
+        st.warning("Automatic sending is **off** — approved emails are copied into Gmail by hand. "
+                   "Turn on one-click sending below.")
+        with st.expander("How to turn on automatic sending (about 5 minutes)"):
+            st.markdown(
+                "You'll send from your own Gmail / Google Workspace using an **App Password** "
+                "(safer than your real password, and revocable anytime).\n\n"
+                "1. Turn on **2-Step Verification** at **myaccount.google.com → Security** "
+                "(required for App Passwords).\n"
+                "2. Go to **myaccount.google.com/apppasswords**, create one named `outreach`, "
+                "and copy the 16-character password it shows.\n"
+                "3. In Streamlit Cloud: **Manage app → Settings → Secrets**, add these lines "
+                "(keep your existing `ANTHROPIC_API_KEY` line too), and Save:"
+            )
+            st.code(
+                'SMTP_EMAIL = "sonia.baig@invasived.com"\n'
+                'SMTP_APP_PASSWORD = "your 16-char app password"\n'
+                'SMTP_FROM_NAME = "Sonia Baig"',
+                language="toml",
+            )
+            st.caption("Use the mailbox the emails should come from. The app restarts automatically; "
+                       "then send yourself a test here before emailing real people.")
 
     st.subheader("💾 Database")
     st.caption("Streamlit Cloud storage can reset when the app restarts — "
