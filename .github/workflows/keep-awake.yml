@@ -1,0 +1,35 @@
+name: Keep app awake
+
+# Pings the Streamlit app on a schedule so Streamlit Community Cloud does not
+# put it to sleep for inactivity. A plain HTTP request counts as traffic.
+#
+# Runs every 30 minutes, which stays comfortably within the free GitHub Actions
+# minutes allowance even on a private repo. If the app still occasionally sleeps,
+# a purpose-built uptime monitor (e.g. UptimeRobot, 5-minute checks) is the more
+# aggressive option.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+# No repository access needed — this job only makes outbound web requests.
+permissions: {}
+
+concurrency:
+  group: keep-awake
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the app to keep it awake
+        run: |
+          APP="https://invasive-outreach-agent.streamlit.app"
+          # Hit the Streamlit health endpoint and the app root. Errors are
+          # ignored on purpose — the request itself is the point, and we never
+          # want this keep-alive to send failure emails.
+          curl -s -o /dev/null -L --max-time 30 "$APP/_stcore/health" || true
+          curl -s -o /dev/null -L --max-time 30 "$APP/" || true
+          echo "Pinged $APP to keep it awake."

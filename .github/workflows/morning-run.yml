@@ -1,0 +1,71 @@
+name: Morning discovery run
+
+# Opens the app in a headless browser once a day, shortly after 11:00 AM India
+# time. Loading the app in a real browser establishes the Streamlit session that
+# runs the daily discovery (the app itself only runs discovery at/after 11:00 AM
+# IST), so by the time you open it the outreach emails are already drafted and
+# waiting in Pending Approvals. If Streamlit Cloud has the app asleep, this also
+# clicks the "wake up" button first.
+#
+# 05:35 UTC = 11:05 AM IST (IST = UTC + 5:30). GitHub may delay scheduled runs by
+# several minutes at peak times; the app tolerates this because it self-gates to
+# 11:00 AM IST or later.
+
+on:
+  schedule:
+    - cron: '35 5 * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: morning-run
+  cancel-in-progress: false
+
+jobs:
+  wake-and-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Open the app to trigger the morning run
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+
+          URL = "https://invasive-outreach-agent.streamlit.app"
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              print("Opening", URL)
+              page.goto(URL, wait_until="domcontentloaded", timeout=120000)
+              page.wait_for_timeout(8000)
+
+              # If Streamlit Cloud has the app asleep, click the wake button.
+              woke = False
+              for sel in ["text=get this app back up", "text=Yes, get this app"]:
+                  try:
+                      el = page.locator(sel)
+                      if el.count() > 0:
+                          el.first.click(timeout=5000)
+                          print("Clicked wake button; waiting for the app to boot")
+                          page.wait_for_timeout(60000)
+                          woke = True
+                          break
+                  except Exception as e:
+                      print("wake attempt:", e)
+
+              # Give Streamlit time to establish the session and run discovery.
+              page.wait_for_timeout(120000)
+              print("Session complete. App was asleep:", woke)
+              browser.close()
+          PY
