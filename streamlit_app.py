@@ -13,7 +13,7 @@ from agents.job_researcher import research_job
 from agents.company_researcher import research_company
 from agents.lead_qualifier import score_lead, explain_score
 from agents.source_scraper import scrape_source, looks_like_design_job
-from mailer.generator import generate_email
+from mailer.generator import generate_email, clean_job_title
 
 st.set_page_config(page_title="Invasive Outreach Agent", layout="wide")
 
@@ -81,12 +81,13 @@ def discover_and_save(job_url, actor='SYSTEM', require_design_title=True):
         result['skip_reason'] = f"Could not read job page: {job['error']}"
         return result
 
-    job_title = job.get('job_title') or ''
+    raw_title = job.get('job_title') or ''
+    job_title = clean_job_title(raw_title)
     job_description = job.get('job_description') or ''
     company_name = job.get('company_name')
     company_domain = job.get('company_domain')
 
-    if require_design_title and not looks_like_design_job(job_title):
+    if require_design_title and not looks_like_design_job(raw_title):
         result['skip_reason'] = 'Not a design role'
         return result
 
