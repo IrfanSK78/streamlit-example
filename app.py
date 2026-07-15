@@ -97,74 +97,63 @@ def page_discover_lead():
         with st.expander("Scoring Details"):
             st.write(explain_score(score_result))
 
-        if score_result['score'] >= 70:
-            st.success("✅ This lead qualifies for outreach")
+        is_dup, dup_info = check_duplicate(
+            job_url=job_url,
+            company_domain=company_domain
+        )
 
-            is_dup, dup_info = check_duplicate(
-                job_url=job_url,
-                company_domain=company_domain
-            )
-
-            if is_dup:
-                if dup_info['type'] == 'COMPANY_CONTACTED':
-                    st.error(f"❌ Company already contacted: {dup_info['lead_id']} (Status: {dup_info['status']})")
-                else:
-                    st.warning(f"⚠️ This job was already researched: {dup_info['lead_id']}")
+        if is_dup:
+            if dup_info['type'] == 'COMPANY_CONTACTED':
+                st.error(f"❌ Company already contacted: {dup_info['lead_id']} (Status: {dup_info['status']})")
             else:
-                is_dnc, dnc_reason = check_do_not_contact(company_domain=company_domain)
-                if is_dnc:
-                    st.error(f"❌ Company is on do-not-contact list: {dnc_reason}")
-                else:
-                    with st.spinner("Generating personalized email..."):
-                        themes = extract_key_themes(job_research['job_description'] or '')
-                        email_result = generate_email(
-                            job_title=job_research['job_title'] or '',
-                            company_name=company_name or '',
-                            themes=themes,
-                            job_description=job_research['job_description'] or ''
-                        )
-
-                        subject_line = email_result.get('subject', 'Design Opportunity at ' + (company_name or 'Your Company'))
-                        email_body = email_result.get('body', '')
-
-                        lead_data = {
-                            'company_name': company_name,
-                            'company_domain': company_domain,
-                            'company_website': company_research.get('company_website'),
-                            'job_title': job_research['job_title'],
-                            'job_url': job_url,
-                            'job_description': job_research['job_description'],
-                            'date_discovered': datetime.now().isoformat(),
-                            'outreach_subject': subject_line,
-                            'outreach_email': email_body,
-                            'status': 'DRAFT_READY'
-                        }
-
-                        lead_id = create_lead(lead_data)
-                        log_audit(lead_id, 'LEAD_QUALIFIED', actor='SYSTEM', details=f'Score: {score_result["score"]}')
-
-                        update_lead(lead_id, {
-                            'lead_fit_score': score_result['score'],
-                            'fit_score_reasons': str(score_result['factors'])
-                        })
-
-                        st.subheader("📧 Email Ready")
-                        st.text_input("Subject", value=subject_line, disabled=True)
-                        st.text_area("Email Body", value=email_body, height=300, disabled=True)
-
-                        st.info("💡 Copy the subject and email body above. Send manually from your Gmail inbox to the recipient.")
-
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("💾 Save to Lead History", type="primary"):
-                                st.success(f"✅ Lead saved! Find it in Lead History (ID: {lead_id})")
-                                st.balloons()
-
-                        with col2:
-                            st.write("")
-
+                st.warning(f"⚠️ This job was already researched: {dup_info['lead_id']}")
         else:
-            st.warning(f"Lead score {score_result['score']}/100 - Below threshold of 70")
+            is_dnc, dnc_reason = check_do_not_contact(company_domain=company_domain)
+            if is_dnc:
+                st.error(f"❌ Company is on do-not-contact list: {dnc_reason}")
+            else:
+                with st.spinner("Generating personalized email..."):
+                    themes = extract_key_themes(job_research['job_description'] or '')
+                    email_result = generate_email(
+                        job_title=job_research['job_title'] or '',
+                        company_name=company_name or '',
+                        themes=themes,
+                        job_description=job_research['job_description'] or ''
+                    )
+
+                    subject_line = email_result.get('subject', 'Design Opportunity at ' + (company_name or 'Your Company'))
+                    email_body = email_result.get('body', '')
+
+                    lead_data = {
+                        'company_name': company_name,
+                        'company_domain': company_domain,
+                        'company_website': company_research.get('company_website'),
+                        'job_title': job_research['job_title'],
+                        'job_url': job_url,
+                        'job_description': job_research['job_description'],
+                        'date_discovered': datetime.now().isoformat(),
+                        'outreach_subject': subject_line,
+                        'outreach_email': email_body,
+                        'status': 'DRAFT_READY'
+                    }
+
+                    lead_id = create_lead(lead_data)
+                    log_audit(lead_id, 'LEAD_DISCOVERED', actor='SYSTEM', details=f'Score: {score_result["score"]}')
+
+                    update_lead(lead_id, {
+                        'lead_fit_score': score_result['score'],
+                        'fit_score_reasons': str(score_result['factors'])
+                    })
+
+                    st.subheader("📧 Email Generated")
+                    st.text_input("Subject", value=subject_line, disabled=True)
+                    st.text_area("Email Body", value=email_body, height=300, disabled=True)
+
+                    st.info("✅ Email saved to Approval Queue. Go to 'Pending Approvals' to review and send.")
+
+                    if st.button("📋 Go to Approval Queue", type="primary"):
+                        st.session_state.current_page = "approvals"
+                        st.rerun()
 
 def page_leads_list():
     """Page: View all leads."""
@@ -320,6 +309,71 @@ def page_settings():
                 mime="text/csv"
             )
 
+def page_approval_queue():
+    """Page: Review and approve pending emails."""
+    st.header("⏳ Pending Approvals")
+
+    pending = list_leads(status='DRAFT_READY', limit=100)
+
+    if not pending:
+        st.info("✅ No pending emails. All caught up!")
+        return
+
+    st.write(f"**{len(pending)} emails waiting for approval**")
+    st.divider()
+
+    approval_states = {}
+
+    for lead in pending:
+        with st.expander(f"🔍 {lead['company_name']} - {lead['job_title']} (Score: {lead['lead_fit_score']}/100)"):
+            col1, col2 = st.columns([1, 3])
+
+            with col1:
+                st.metric("Score", f"{lead['lead_fit_score']}/100")
+                approval_states[lead['lead_id']] = st.checkbox(
+                    "Approve",
+                    key=f"approve_{lead['lead_id']}"
+                )
+
+            with col2:
+                st.write(f"**To:** Contact email")
+                st.text_input("Subject", value=lead['outreach_subject'], disabled=True, key=f"subj_{lead['lead_id']}")
+                st.text_area("Email", value=lead['outreach_email'], height=200, disabled=True, key=f"body_{lead['lead_id']}")
+
+    st.divider()
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if st.button("✅ Approve Selected", type="primary"):
+            approved_leads = [lead_id for lead_id, approved in approval_states.items() if approved]
+
+            if not approved_leads:
+                st.warning("Please select emails to approve")
+            else:
+                for lead_id in approved_leads:
+                    update_lead(lead_id, {'status': 'APPROVED'})
+                    log_audit(lead_id, 'EMAIL_APPROVED', actor='USER', details='Ready to send')
+
+                st.success(f"✅ {len(approved_leads)} emails approved and ready to send!")
+                st.balloons()
+                st.rerun()
+
+    with col2:
+        if st.button("✅ Approve All"):
+            for lead in pending:
+                update_lead(lead['lead_id'], {'status': 'APPROVED'})
+                log_audit(lead['lead_id'], 'EMAIL_APPROVED', actor='USER', details='Ready to send')
+
+            st.success(f"✅ All {len(pending)} emails approved!")
+            st.balloons()
+            st.rerun()
+
+    with col3:
+        if st.button("📋 View Approved"):
+            st.session_state.current_page = "leads"
+            st.rerun()
+
 def main():
     """Main app."""
     st.sidebar.title("Invasive Outreach Agent")
@@ -327,17 +381,27 @@ def main():
     if 'current_page' not in st.session_state:
         st.session_state.current_page = "discover"
 
-    page = st.sidebar.radio(
-        "Navigation",
-        ["Discover Lead", "Lead History", "Settings"],
-        index=0 if st.session_state.current_page == "discover" else (1 if st.session_state.current_page == "leads" else 2)
-    )
+    page_options = ["Discover Lead", "Pending Approvals", "Lead History", "Settings"]
+    page_index = {
+        "discover": 0,
+        "approvals": 1,
+        "leads": 2,
+        "settings": 3
+    }.get(st.session_state.current_page, 0)
+
+    page = st.sidebar.radio("Navigation", page_options, index=page_index)
 
     if page == "Discover Lead":
+        st.session_state.current_page = "discover"
         page_discover_lead()
+    elif page == "Pending Approvals":
+        st.session_state.current_page = "approvals"
+        page_approval_queue()
     elif page == "Lead History":
+        st.session_state.current_page = "leads"
         page_leads_list()
     elif page == "Settings":
+        st.session_state.current_page = "settings"
         page_settings()
 
 if __name__ == "__main__":
