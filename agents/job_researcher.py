@@ -64,12 +64,15 @@ def research_job(job_url):
         }
     except Exception as e:
         logger.error(f"Error parsing job: {str(e)}")
+        company_domain = extract_domain_from_url(job_url)
+        if is_job_board(company_domain):
+            company_domain = None
         return {
             'status': 'PARTIAL',
             'error': str(e),
             'job_title': None,
             'company_name': None,
-            'company_domain': extract_domain_from_url(job_url),
+            'company_domain': company_domain,
             'job_description': None,
             'warnings': ['Could not parse all job details']
         }
@@ -88,15 +91,19 @@ def extract_company_from_text(text):
     """Pull a company name out of text like 'Senior Designer at Acme - Remote OK'."""
     if not text:
         return None
+    # Split at separators that have whitespace on both sides, so hyphenated
+    # company names like 'Foo-Bar' survive intact.
     chunk = re.split(r'\s+[-|–—•]\s+', text)[0]
-    match = re.search(r'\bat\s+([A-Z][A-Za-z0-9&.\' ]{1,40})', chunk)
+    match = re.search(r"\bat\s+([A-Z][A-Za-z0-9&.' -]{1,40})", chunk)
     if match:
-        name = match.group(1).strip(' .')
+        name = match.group(1).strip(' .-')
         if 2 <= len(name) <= 60:
             return name
-    match = re.match(r'\s*([A-Z][A-Za-z0-9&.\' ]{1,40})\s+is hiring', text)
+    # 'X is hiring ...' (WeWorkRemotely format). Allow lowercase-branded
+    # names like eBay or airbnb.
+    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9&.' -]{1,40}?)\s+is hiring", text)
     if match:
-        name = match.group(1).strip(' .')
+        name = match.group(1).strip(' .-')
         if 2 <= len(name) <= 60:
             return name
     return None
@@ -135,9 +142,11 @@ def extract_domain_from_url(url):
     """Extract domain from URL."""
     try:
         parsed = urlparse(url)
-        domain = parsed.netloc.replace('www.', '')
+        domain = parsed.netloc.split(':')[0].lower()
+        if domain.startswith('www.'):
+            domain = domain[4:]
         if domain:
-            return domain.split('/')[0]
+            return domain
     except:
         pass
     return None

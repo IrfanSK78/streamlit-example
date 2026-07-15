@@ -3,7 +3,7 @@
 import re
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import logging
 
 logger = logging.getLogger(__name__)
@@ -21,11 +21,14 @@ DESIGN_LINK_PATTERNS = [
 ]
 _design_re = re.compile('|'.join(DESIGN_LINK_PATTERNS), re.IGNORECASE)
 
-SKIP_URL_WORDS = [
+# Matched against whole URL path segments (not substrings), so a job slug
+# like 'designer-about-you-gmbh' is not wrongly skipped by 'about'.
+SKIP_PATH_SEGMENTS = {
     'login', 'signup', 'sign-up', 'signin', 'sign-in', 'register',
     'privacy', 'terms', 'about', 'pricing', 'faq', 'advertise',
-    'contact-us', 'blog', 'newsletter', 'subscribe',
-]
+    'contact', 'contact-us', 'blog', 'newsletter', 'subscribe',
+    'categories',
+}
 
 MAX_LINKS_PER_SOURCE = 15
 
@@ -68,10 +71,6 @@ def scrape_source(source_url):
         if not href or href.startswith(('#', 'mailto:', 'javascript:', 'tel:')):
             continue
 
-        href_lower = href.lower()
-        if any(word in href_lower for word in SKIP_URL_WORDS):
-            continue
-
         link_text = link.get_text(separator=' ', strip=True)
         if not looks_like_design_job(link_text):
             continue
@@ -81,6 +80,11 @@ def scrape_source(source_url):
             continue
         if full_url.rstrip('/') == source_url.rstrip('/'):
             continue
+
+        path_segments = [seg.lower() for seg in urlparse(full_url).path.split('/') if seg]
+        if any(seg in SKIP_PATH_SEGMENTS for seg in path_segments):
+            continue
+
         if full_url in seen:
             continue
 

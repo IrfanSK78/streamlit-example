@@ -90,6 +90,28 @@ def check_duplicate(job_url=None, company_domain=None):
     conn.close()
     return False, None
 
+def check_company_name_duplicate(company_name):
+    """Check if a company (matched by name) already has an active lead.
+
+    Leads from job boards have no company domain, so name matching is the
+    only way to avoid drafting two emails to the same employer.
+    """
+    if not company_name:
+        return False, None
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT lead_id, status FROM leads "
+        "WHERE LOWER(company_name) = LOWER(?) AND status != 'NOT_QUALIFIED' LIMIT 1",
+        (company_name,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return True, {'lead_id': row['lead_id'], 'status': row['status']}
+    return False, None
+
 def check_do_not_contact(company_domain):
     """Check if company is on DNC list."""
     init_db()

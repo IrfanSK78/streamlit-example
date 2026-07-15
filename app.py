@@ -4,7 +4,8 @@ import streamlit as st
 from datetime import datetime, timezone, timedelta
 from database.db import (
     init_db, create_lead, get_lead, list_leads, update_lead,
-    check_duplicate, check_do_not_contact, log_audit, get_audit_trail,
+    check_duplicate, check_do_not_contact, check_company_name_duplicate,
+    log_audit, get_audit_trail,
     add_do_not_contact, add_job_source, list_job_sources, remove_job_source,
     get_state, set_state
 )
@@ -19,6 +20,7 @@ st.set_page_config(page_title="Invasive Outreach Agent", layout="wide")
 IST = timezone(timedelta(hours=5, minutes=30))
 DAILY_APPROVAL_LIMIT = 20
 MAX_NEW_LEADS_PER_RUN = 20
+MORNING_RUN_HOUR = 11  # Auto-run fires on the first visit at/after 11:00 AM IST
 
 DEFAULT_SOURCES = [
     ('https://weworkremotely.com/categories/remote-design-jobs', 'We Work Remotely - Design'),
@@ -91,6 +93,12 @@ def discover_and_save(job_url, actor='SYSTEM', require_design_title=True):
         result['skip_reason'] = f"Company already contacted (lead {dup_info['lead_id']})"
         return result
 
+    is_dup, dup_info = check_company_name_duplicate(company_name)
+    if is_dup:
+        result['skip_reason'] = (f"Company already has a lead "
+                                 f"({dup_info['lead_id']}, {dup_info['status']})")
+        return result
+
     is_dnc, dnc_reason = check_do_not_contact(company_domain=company_domain)
     if is_dnc:
         result['skip_reason'] = f'On do-not-contact list: {dnc_reason}'
@@ -104,7 +112,7 @@ def discover_and_save(job_url, actor='SYSTEM', require_design_title=True):
         job_description=job_description,
         date_posted=None,
         company_website=company.get('company_website'),
-        date_discovered=datetime.now().isoformat()
+        date_discovered=ist_now().isoformat()
     )
     result['score'] = score_result
 
@@ -123,11 +131,11 @@ def discover_and_save(job_url, actor='SYSTEM', require_design_title=True):
         'job_title': job_title,
         'job_url': job_url,
         'job_description': job_description,
-        'date_discovered': datetime.now().isoformat(),
+        'date_discovered': ist_now().isoformat(),
         'outreach_subject': email_result['subject'],
         'outreach_email': email_result['body'],
         'lead_fit_score': score_result['score'],
-        'fit_score_reasons': str(score_result['factors']),
+        'fit_score_reasons': explain_score(score_result),
         'status': 'DRAFT_READY'
     })
     log_audit(lead_id, 'LEAD_DISCOVERED', actor=actor, details=f'Score: {score_result["score"]}')
@@ -138,12 +146,18 @@ def discover_and_save(job_url, actor='SYSTEM', require_design_title=True):
 
 def run_daily_discovery(force=False):
     """
-    Once per day (first time the app is opened, India time), search every
-    configured job source for new design jobs and draft outreach emails.
+    Once per day, search every configured job source for new design jobs and
+    draft outreach emails. The automatic run fires on the first time the app is
+    opened at or after 11:00 AM India time each day; the Settings "Run now"
+    button (force=True) bypasses both the once-a-day and the time-of-day guards.
     """
     today = ist_today()
-    if not force and get_state('last_run_date') == today:
-        return
+    if not force:
+        if get_state('last_run_date') == today:
+            return
+        if ist_now().hour < MORNING_RUN_HOUR:
+            # Too early — wait until the morning run window.
+            return
 
     sources = list_job_sources(enabled_only=True)
     if not sources:
@@ -163,7 +177,11 @@ def run_daily_discovery(force=False):
             name = source['label'] or source['url']
             st.write(f"🔎 Searching {name}...")
 
-            scraped = scrape_source(source['url'])
+            try:
+                scraped = scrape_source(source['url'])
+            except Exception as e:
+                scraped = {'status': 'ERROR', 'error': str(e), 'job_urls': []}
+
             if scraped['status'] == 'ERROR':
                 failed_sources += 1
                 st.write(f"⚠️ Could not read {name}: {scraped['error']}")
@@ -176,7 +194,12 @@ def run_daily_discovery(force=False):
             for job_url in scraped['job_urls']:
                 if created >= MAX_NEW_LEADS_PER_RUN:
                     break
-                r = discover_and_save(job_url, actor='SYSTEM')
+                # One bad job page must never kill the whole morning run.
+                try:
+                    r = discover_and_save(job_url, actor='SYSTEM')
+                except Exception:
+                    skipped += 1
+                    continue
                 if r['lead_id']:
                     created += 1
                     job = r['job'] or {}
@@ -210,36 +233,42 @@ def page_discover_lead():
 
     if st.button("Research & Draft Email", type="primary") and job_url:
         with st.spinner("Researching job and drafting email..."):
-            result = discover_and_save(job_url, actor='USER', require_design_title=False)
+            # Persist so the result survives reruns (expander taps etc.).
+            st.session_state.last_discover_result = discover_and_save(
+                job_url, actor='USER', require_design_title=False)
 
-        if result['skip_reason']:
-            st.warning(f"Skipped: {result['skip_reason']}")
-            return
+    result = st.session_state.get('last_discover_result')
+    if not result:
+        return
 
-        job = result['job']
-        score = result['score']
-        email = result['email']
+    if result['skip_reason']:
+        st.warning(f"Skipped: {result['skip_reason']}")
+        return
 
-        st.success("✅ Email drafted and added to Pending Approvals")
+    job = result['job']
+    score = result['score']
+    email = result['email']
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write(f"**Job Title:** {job.get('job_title') or 'Unknown'}")
-            st.write(f"**Company:** {job.get('company_name') or 'Unknown'}")
-        with col2:
-            st.metric("Lead Fit Score", f"{score['score']}/100", score['recommendation'])
+    st.success("✅ Email drafted and added to Pending Approvals")
 
-        with st.expander("Scoring details"):
-            st.write(explain_score(score))
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write(f"**Job Title:** {job.get('job_title') or 'Unknown'}")
+        st.write(f"**Company:** {job.get('company_name') or 'Unknown'}")
+    with col2:
+        st.metric("Lead Fit Score", f"{score['score']}/100", score['recommendation'])
 
-        if job.get('job_description'):
-            with st.expander("Job description"):
-                st.text(job['job_description'][:3000])
+    with st.expander("Scoring details"):
+        st.write(explain_score(score))
 
-        st.text_input("Subject", value=email['subject'], disabled=True)
-        st.text_area("Email Body", value=email['body'], height=280, disabled=True)
+    if job.get('job_description'):
+        with st.expander("Job description"):
+            st.text(job['job_description'][:3000])
 
-        st.info("Go to **Pending Approvals** in the sidebar to approve it.")
+    st.text_input("Subject", value=email['subject'], disabled=True)
+    st.text_area("Email Body", value=email['body'], height=280, disabled=True)
+
+    st.info("Go to **Pending Approvals** in the sidebar to approve it.")
 
 def page_approval_queue():
     """Page: Review and approve pending emails (max 20 per day)."""
@@ -324,8 +353,7 @@ def page_leads_list():
     st.header("📋 Lead History")
 
     status_filter = st.selectbox("Filter by status", ["ALL"] + [
-        'DRAFT_READY', 'APPROVED', 'CONTACTED', 'REPLIED',
-        'NOT_QUALIFIED', 'DISCOVERED'
+        'DRAFT_READY', 'APPROVED', 'CONTACTED', 'NOT_QUALIFIED'
     ])
 
     leads = list_leads(status=None if status_filter == "ALL" else status_filter, limit=100)
@@ -392,22 +420,42 @@ def page_review_email():
         st.write("**Email body:**")
         st.code(lead['outreach_email'] or '', language=None)
 
-        contact_email = st.text_input("Recipient email (optional, saved for your records)",
-                                      placeholder="name@company.com")
-
         col1, col2 = st.columns(2)
-        with col1:
-            if st.button("✅ Mark as Sent", type="primary"):
-                updates = {'status': 'CONTACTED', 'date_contacted': datetime.now().isoformat()}
-                if contact_email:
-                    updates['contact_email'] = contact_email
-                update_lead(lead_id, updates)
-                details = 'Sent manually from Gmail'
-                if contact_email:
-                    details += f' to {contact_email}'
-                log_audit(lead_id, 'EMAIL_SENT', actor='USER', details=details)
-                st.session_state.flash = "✅ Marked as sent."
-                st.rerun()
+
+        if lead['status'] == 'DRAFT_READY':
+            # Sending goes through approval so the 20/day limit always applies.
+            remaining_today = max(0, DAILY_APPROVAL_LIMIT - get_approved_today())
+            st.info("This email is not approved yet — approve it before sending.")
+            with col1:
+                if st.button("✅ Approve this email", type="primary",
+                             disabled=remaining_today == 0):
+                    update_lead(lead_id, {'status': 'APPROVED'})
+                    log_audit(lead_id, 'EMAIL_APPROVED', actor='USER',
+                              details='Approved from review page')
+                    add_approved_today(1)
+                    st.session_state.flash = "✅ Approved — now copy it into Gmail and mark it as sent."
+                    st.rerun()
+                if remaining_today == 0:
+                    st.caption(f"Daily limit of {DAILY_APPROVAL_LIMIT} approvals reached — "
+                               "try again tomorrow.")
+        else:
+            contact_email = st.text_input("Recipient email (optional, saved for your records)",
+                                          placeholder="name@company.com")
+            with col1:
+                if st.button("✅ Mark as Sent", type="primary"):
+                    updates = {'status': 'CONTACTED', 'date_contacted': ist_now().isoformat()}
+                    if contact_email:
+                        updates['contact_email'] = contact_email
+                    update_lead(lead_id, updates)
+                    details = 'Sent manually from Gmail'
+                    if contact_email:
+                        details += f' to {contact_email}'
+                    log_audit(lead_id, 'EMAIL_SENT', actor='USER', details=details)
+                    st.session_state.flash = "✅ Marked as sent."
+                    st.session_state.current_page = "leads"
+                    st.session_state.current_lead_id = None
+                    st.rerun()
+
         with col2:
             if st.button("❌ Mark as Not Qualified"):
                 update_lead(lead_id, {'status': 'NOT_QUALIFIED'})
@@ -441,8 +489,9 @@ def page_settings():
     st.header("⚙️ Settings")
 
     st.subheader("🌅 Morning Run — Job Sources")
-    st.write("The first time you open the app each day (India time), it automatically searches "
-             "these pages for new design jobs and drafts outreach emails for your approval.")
+    st.write("When you open the app in the morning (from 11:00 AM India time), it automatically "
+             "searches these pages once a day for new design jobs and drafts outreach emails for "
+             "your approval. Open it any time after 11 AM and the emails will be waiting.")
 
     last_run = get_state('last_run_time')
     last_summary = get_state('last_run_summary')
@@ -468,9 +517,9 @@ def page_settings():
         if st.form_submit_button("➕ Add Source"):
             if new_url.strip():
                 if add_job_source(new_url.strip(), new_label.strip() or None):
-                    st.success("Source added — it will be searched on the next run.")
+                    st.session_state.flash = "✅ Source added — it will be searched on the next run."
                 else:
-                    st.warning("That URL is already in the list.")
+                    st.session_state.flash_warning = "That URL is already in the list."
                 st.rerun()
             else:
                 st.error("Please enter a URL.")
@@ -489,22 +538,21 @@ def page_settings():
     st.caption("Streamlit Cloud storage can reset when the app restarts — "
                "export your leads to CSV regularly as a backup.")
 
-    if st.button("Export Leads to CSV"):
-        from database.db import export_to_csv
+    from database.db import export_to_csv
 
-        filepath = export_to_csv()
-        if filepath:
-            with open(filepath, 'r') as f:
-                csv_data = f.read()
+    filepath = export_to_csv()
+    if filepath:
+        with open(filepath, 'r') as f:
+            csv_data = f.read()
 
-            st.download_button(
-                label="Download CSV",
-                data=csv_data,
-                file_name="leads_export.csv",
-                mime="text/csv"
-            )
-        else:
-            st.info("No leads to export yet.")
+        st.download_button(
+            label="⬇️ Download all leads as CSV",
+            data=csv_data,
+            file_name="leads_export.csv",
+            mime="text/csv"
+        )
+    else:
+        st.caption("No leads to export yet.")
 
 def main():
     """Main app."""
@@ -513,15 +561,19 @@ def main():
     if 'current_page' not in st.session_state:
         st.session_state.current_page = "discover"
 
+    # Run discovery BEFORE rendering the sidebar badge so the counts are fresh.
+    force_run = st.session_state.pop('force_run', False)
+    run_daily_discovery(force=force_run)
+
     pending_count = len(list_leads(status='DRAFT_READY', limit=100))
     st.sidebar.caption(f"⏳ {pending_count} pending · "
                        f"✅ {get_approved_today()}/{DAILY_APPROVAL_LIMIT} approved today")
     last_run = get_state('last_run_time')
     if last_run:
         st.sidebar.caption(f"🌅 Last morning run: {last_run}")
-
-    force_run = st.session_state.pop('force_run', False)
-    run_daily_discovery(force=force_run)
+    else:
+        next_run = "today" if ist_now().hour < MORNING_RUN_HOUR else "tomorrow"
+        st.sidebar.caption(f"🌅 Next morning run: {next_run} at 11:00 AM IST")
 
     flash = st.session_state.pop('flash', None)
     if flash:
