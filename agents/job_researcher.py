@@ -1,147 +1,82 @@
-"""Extract job information from URLs and job postings."""
+"""Research job postings from URLs."""
 
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 import logging
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def fetch_job_page(job_url):
-    """
-    Fetch job posting page content.
-    Returns: (html_content, error_message)
-    """
+def research_job(job_url):
+    """Research a job posting from URL."""
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(job_url, headers=headers, timeout=10)
+        response = requests.get(job_url, timeout=10)
         response.raise_for_status()
-        return response.text, None
     except requests.exceptions.Timeout:
-        return None, "Timeout: Job page took too long to load"
+        return {'status': 'ERROR', 'error': 'Request timed out', 'warnings': []}
     except requests.exceptions.ConnectionError:
-        return None, "Connection error: Could not reach job URL"
+        return {'status': 'ERROR', 'error': 'Connection failed', 'warnings': []}
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            return None, "Job posting not found (404) - may be expired"
-        return None, f"HTTP error: {e.response.status_code}"
+            return {'status': 'ERROR', 'error': 'Page not found (404)', 'warnings': []}
+        return {'status': 'ERROR', 'error': f'HTTP error: {e.response.status_code}', 'warnings': []}
     except Exception as e:
-        return None, f"Error fetching page: {str(e)}"
+        return {'status': 'ERROR', 'error': str(e), 'warnings': []}
 
-def extract_text_sections(html):
-    """Extract main text content from HTML."""
-    soup = BeautifulSoup(html, 'html.parser')
-
-    for script in soup(["script", "style"]):
-        script.decompose()
-
-    text = soup.get_text(separator='\n', strip=True)
-    return text
-
-def guess_job_title_from_page(html, job_url):
-    """
-    Try to extract job title from page.
-    Returns: job_title or None
-    """
-    soup = BeautifulSoup(html, 'html.parser')
-
-    title_tag = soup.find('h1')
-    if title_tag:
-        return title_tag.get_text(strip=True)
-
-    og_title = soup.find('meta', property='og:title')
-    if og_title and og_title.get('content'):
-        return og_title.get('content')
-
-    page_title = soup.find('title')
-    if page_title:
-        return page_title.get_text(strip=True)
-
-    return None
-
-def guess_company_from_url(job_url):
-    """
-    Try to extract company name from job URL.
-    Returns: company_name or None
-
-    Examples:
-    - https://jobs.lever.co/acme/... -> acme
-    - https://greenhouse.io/...acme... -> acme (if extractable)
-    - https://careers.acme.com/... -> acme
-    """
-    parsed = urlparse(job_url)
-    domain = parsed.netloc.lower()
-
-    # careers.acme.com -> acme
-    if 'careers.' in domain:
-        return domain.replace('careers.', '').split('.')[0]
-
-    # jobs.acme.com -> acme
-    if 'jobs.' in domain:
-        return domain.replace('jobs.', '').split('.')[0]
-
-    # acme.com (generic) -> harder to extract reliably
-    if domain.count('.') >= 1:
-        parts = domain.split('.')
-        if parts[0] not in ['www', 'jobs', 'careers']:
-            return parts[0]
-
-    return None
-
-def research_job(job_url):
-    """
-    Research a job posting.
-
-    Returns: {
-        'job_url': job_url,
-        'job_title': extracted or guessed,
-        'job_description': full text,
-        'company_name': extracted or guessed,
-        'company_domain': extracted from URL,
-        'status': 'SUCCESS' | 'PARTIAL' | 'ERROR',
-        'error': error_message if any,
-        'warnings': [list of warnings]
-    }
-    """
-    warnings = []
-    html, fetch_error = fetch_job_page(job_url)
-
-    if fetch_error:
+    try:
+        soup = BeautifulSoup(response.content, 'html.parser')
+        text = soup.get_text(separator=' ')
+        job_title = extract_job_title(soup, text)
+        company_name = extract_company_name(soup, job_url)
+        company_domain = extract_domain_from_url(job_url)
+        job_description = text[:5000] if text else None
         return {
-            'job_url': job_url,
-            'job_title': None,
-            'job_description': None,
-            'company_name': None,
-            'company_domain': None,
-            'status': 'ERROR',
-            'error': fetch_error,
+            'status': 'SUCCESS',
+            'job_title': job_title,
+            'company_name': company_name,
+            'company_domain': company_domain,
+            'job_description': job_description,
             'warnings': []
         }
+    except Exception as e:
+        logger.error(f"Error parsing job: {str(e)}")
+        return {
+            'status': 'PARTIAL',
+            'error': str(e),
+            'job_title': None,
+            'company_name': None,
+            'company_domain': extract_domain_from_url(job_url),
+            'job_description': None,
+            'warnings': ['Could not parse all job details']
+        }
 
-    job_title = guess_job_title_from_page(html, job_url)
-    if not job_title:
-        warnings.append('Could not extract job title from page')
+def extract_job_title(soup, text):
+    """Extract job title from page."""
+    h1 = soup.find('h1')
+    if h1:
+        return h1.get_text(strip=True)
+    title_tag = soup.find('title')
+    if title_tag:
+        return title_tag.get_text(strip=True)
+    return 'Job Position'
 
-    job_description = extract_text_sections(html)
-    if not job_description or len(job_description) < 100:
-        warnings.append('Job description is very short or empty')
+def extract_company_name(soup, job_url):
+    """Extract company name from page or URL."""
+    meta = soup.find('meta', property='og:site_name')
+    if meta:
+        return meta.get('content')
+    domain = extract_domain_from_url(job_url)
+    if domain:
+        return domain.split('.')[0].title()
+    return 'Unknown Company'
 
-    company_name = guess_company_from_url(job_url)
-    if not company_name:
-        warnings.append('Could not extract company name from URL')
-
-    company_domain = urlparse(job_url).netloc.lower()
-
-    return {
-        'job_url': job_url,
-        'job_title': job_title,
-        'job_description': job_description,
-        'company_name': company_name,
-        'company_domain': company_domain,
-        'status': 'PARTIAL' if warnings else 'SUCCESS',
-        'error': None,
-        'warnings': warnings
-    }
+def extract_domain_from_url(url):
+    """Extract domain from URL."""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.replace('www.', '')
+        if domain:
+            return domain.split('/')[0]
+    except:
+        pass
+    return None
