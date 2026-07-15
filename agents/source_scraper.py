@@ -32,9 +32,64 @@ SKIP_PATH_SEGMENTS = {
 
 MAX_LINKS_PER_SOURCE = 15
 
+REMOTIVE_API = "https://remotive.com/api/remote-jobs"
+
 def looks_like_design_job(text):
     """True if the text looks like a design role title."""
     return bool(text and _design_re.search(text))
+
+def fetch_structured_jobs(source_url):
+    """Return fully-structured jobs from a board's official data feed when one
+    exists (real company name, title, and description — no scraping guesswork),
+    or None if this source has no supported feed (caller falls back to scraping).
+
+    Returns a dict {'status', 'error', 'jobs': [ {url, job_title, company_name,
+    company_domain, job_description}, ... ]} when a feed is used.
+    """
+    host = urlparse(source_url).netloc.lower()
+    if 'remotive.com' in host:
+        return _fetch_remotive()
+    return None
+
+def _strip_html(html):
+    """Turn an HTML job description into readable plain text."""
+    if not html:
+        return ''
+    try:
+        return BeautifulSoup(html, 'html.parser').get_text(separator=' ').strip()
+    except Exception:
+        return html
+
+def _fetch_remotive():
+    """Fetch design jobs from Remotive's free public API (real employer names)."""
+    try:
+        response = requests.get(REMOTIVE_API, params={'category': 'design'},
+                                timeout=15, headers=HEADERS)
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.Timeout:
+        return {'status': 'ERROR', 'error': 'Request timed out', 'jobs': []}
+    except Exception as e:
+        return {'status': 'ERROR', 'error': str(e), 'jobs': []}
+
+    jobs = []
+    for item in data.get('jobs', []):
+        title = (item.get('title') or '').strip()
+        if not looks_like_design_job(title):
+            continue
+        url = item.get('url')
+        if not url:
+            continue
+        jobs.append({
+            'url': url,
+            'job_title': title,
+            'company_name': (item.get('company_name') or '').strip() or None,
+            'company_domain': None,  # the feed gives the employer name, not its domain
+            'job_description': _strip_html(item.get('description') or '')[:5000],
+        })
+        if len(jobs) >= MAX_LINKS_PER_SOURCE:
+            break
+    return {'status': 'SUCCESS', 'error': None, 'jobs': jobs}
 
 def scrape_source(source_url):
     """

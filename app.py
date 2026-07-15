@@ -12,7 +12,7 @@ from database.db import (
 from agents.job_researcher import research_job
 from agents.company_researcher import research_company
 from agents.lead_qualifier import score_lead, explain_score
-from agents.source_scraper import scrape_source, looks_like_design_job
+from agents.source_scraper import scrape_source, looks_like_design_job, fetch_structured_jobs
 from mailer.generator import generate_email, clean_job_title
 
 st.set_page_config(page_title="Invasive Outreach Agent", layout="wide")
@@ -57,10 +57,13 @@ def initialize_session():
 
 initialize_session()
 
-def discover_and_save(job_url, actor='SYSTEM', require_design_title=True):
+def discover_and_save(job_url, actor='SYSTEM', require_design_title=True, prefetched=None):
     """
     Research one job URL end-to-end: check duplicates, research the job and
     company, score the lead, draft the email, and save it as DRAFT_READY.
+
+    If `prefetched` is given (from a board's structured data feed) it supplies the
+    title, company name, and description directly instead of scraping the page.
 
     Returns a dict:
         lead_id     - new lead id, or None if the job was skipped
@@ -75,7 +78,17 @@ def discover_and_save(job_url, actor='SYSTEM', require_design_title=True):
         result['skip_reason'] = f"Already researched (lead {dup_info['lead_id']})"
         return result
 
-    job = research_job(job_url)
+    if prefetched:
+        job = {
+            'status': 'SUCCESS',
+            'job_title': prefetched.get('job_title'),
+            'company_name': prefetched.get('company_name'),
+            'company_domain': prefetched.get('company_domain'),
+            'job_description': prefetched.get('job_description'),
+            'warnings': [],
+        }
+    else:
+        job = research_job(job_url)
     result['job'] = job
     if job['status'] == 'ERROR':
         result['skip_reason'] = f"Could not read job page: {job['error']}"
@@ -193,26 +206,41 @@ def run_daily_discovery(force=False):
             name = source['label'] or source['url']
             st.write(f"🔎 Searching {name}...")
 
+            # Prefer a structured data feed (real employer names) when the board
+            # offers one; otherwise fall back to scraping links off the page.
+            feed = None
             try:
-                scraped = scrape_source(source['url'])
+                feed = fetch_structured_jobs(source['url'])
             except Exception as e:
-                scraped = {'status': 'ERROR', 'error': str(e), 'job_urls': []}
+                feed = {'status': 'ERROR', 'error': str(e), 'jobs': []}
 
-            if scraped['status'] == 'ERROR':
-                failed_sources += 1
-                st.write(f"⚠️ Could not read {name}: {scraped['error']}")
-                continue
+            if feed is not None:
+                if feed['status'] == 'ERROR':
+                    failed_sources += 1
+                    st.write(f"⚠️ Could not read {name}: {feed['error']}")
+                    continue
+                work_items = [(j['url'], j) for j in feed['jobs']]
+            else:
+                try:
+                    scraped = scrape_source(source['url'])
+                except Exception as e:
+                    scraped = {'status': 'ERROR', 'error': str(e), 'job_urls': []}
+                if scraped['status'] == 'ERROR':
+                    failed_sources += 1
+                    st.write(f"⚠️ Could not read {name}: {scraped['error']}")
+                    continue
+                work_items = [(u, None) for u in scraped['job_urls']]
 
-            if not scraped['job_urls']:
+            if not work_items:
                 st.write("No design job links found on this source.")
                 continue
 
-            for job_url in scraped['job_urls']:
+            for job_url, prefetched in work_items:
                 if created >= MAX_NEW_LEADS_PER_RUN:
                     break
                 # One bad job page must never kill the whole morning run.
                 try:
-                    r = discover_and_save(job_url, actor='SYSTEM')
+                    r = discover_and_save(job_url, actor='SYSTEM', prefetched=prefetched)
                 except Exception:
                     skipped += 1
                     continue
