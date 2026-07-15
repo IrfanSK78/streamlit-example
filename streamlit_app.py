@@ -25,6 +25,8 @@ MORNING_RUN_HOUR = 11  # Auto-run fires on the first visit at/after 11:00 AM IST
 DEFAULT_SOURCES = [
     ('https://weworkremotely.com/categories/remote-design-jobs', 'We Work Remotely - Design'),
     ('https://remoteok.com/remote-design-jobs', 'RemoteOK - Design'),
+    ('https://jobspresso.co/remote-design-jobs/', 'Jobspresso - Design'),
+    ('https://remotive.com/remote-jobs/design', 'Remotive - Design'),
 ]
 
 def ist_now():
