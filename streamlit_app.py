@@ -10,7 +10,7 @@ from database.db import (
 from agents.job_researcher import research_job
 from agents.company_researcher import research_company
 from agents.lead_qualifier import score_lead, explain_score
-from mailer.generator import generate_email, extract_key_themes
+from mailer.generator import generate_email
 from mailer.gmail_service import send_email, test_connection
 
 st.set_page_config(page_title="Invasive Outreach Agent", layout="wide")
@@ -113,12 +113,11 @@ def page_discover_lead():
                 st.error(f"❌ Company is on do-not-contact list: {dnc_reason}")
             else:
                 with st.spinner("Generating personalized email..."):
-                    themes = extract_key_themes(job_research['job_description'] or '')
                     email_result = generate_email(
                         job_title=job_research['job_title'] or '',
+                        job_description=job_research['job_description'] or '',
                         company_name=company_name or '',
-                        themes=themes,
-                        job_description=job_research['job_description'] or ''
+                        recipient_email=None
                     )
 
                     subject_line = email_result.get('subject', 'Design Opportunity at ' + (company_name or 'Your Company'))
