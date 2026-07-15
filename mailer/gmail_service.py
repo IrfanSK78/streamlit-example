@@ -69,17 +69,20 @@ def get_credentials():
             if not os.path.exists(CREDENTIALS_FILE):
                 streamlit_secrets = _get_streamlit_secrets()
                 if not streamlit_secrets:
-                    logger.error(f"Credentials file not found: {CREDENTIALS_FILE}")
+                    logger.error(f"Credentials file not found: {CREDENTIALS_FILE}. Please run the app locally first to authenticate via OAuth, or add credentials.json to your project.")
                     return None
 
-                logger.info("Using Streamlit secrets for OAuth")
-                return None
+                logger.info("Using Streamlit secrets for OAuth - checking for existing token.json")
+                if not os.path.exists(TOKEN_FILE):
+                    logger.error("Token file not found on Streamlit Cloud. Please run the app locally first with credentials.json to authorize Gmail access.")
+                    return None
 
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
+        if creds:
+            with open(TOKEN_FILE, 'w') as token:
+                token.write(creds.to_json())
 
     return creds
 
