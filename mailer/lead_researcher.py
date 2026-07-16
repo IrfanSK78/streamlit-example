@@ -46,7 +46,12 @@ Warm, confident, human, ~220-340 words. Do NOT include a sign-off, a signature, 
 those are appended automatically. No clichés ("I hope this finds you well", "synergy", "game-changing"), no emojis, \
 no markdown.
 
-Respond with ONLY a JSON object (no markdown, no code fences) with these fields:
+Respond with ONLY a single JSON object — no preamble, no questions, no commentary, no code fences. Do NOT ask the \
+user for more information. If a job link cannot be opened, search the web for the job, the company, and the role and \
+proceed with your best findings. If any detail cannot be confirmed, use null for that field (or your best inference) \
+and explain the uncertainty in "notes" — but ALWAYS return the JSON with a written "subject" and "body".
+
+JSON fields:
 "company", "role", "location", "role_summary", "contact_name", "contact_title", "contact_email", \
 "email_confidence" (one of "published", "inferred", "unknown"), "email_source" (short description including the URL \
 you found it on), "subject", "body", "notes" (anything the user should double-check before sending)."""
@@ -112,12 +117,12 @@ def research_and_write(job_input):
     )}]
 
     try:
-        # Server-side web search may pause the turn between search rounds; resume up to a few times.
+        # Server-side web search may pause the turn between search rounds; resume several times.
         response = None
-        for _ in range(6):
+        for _ in range(10):
             response = client.messages.create(
                 model=MODEL,
-                max_tokens=4000,
+                max_tokens=8000,
                 system=SYSTEM_PROMPT,
                 messages=messages,
                 tools=[WEB_SEARCH_TOOL],
@@ -132,10 +137,15 @@ def research_and_write(job_input):
 
     text = "".join(
         b.text for b in response.content if getattr(b, "type", None) == "text"
-    )
+    ).strip()
     data = _extract_json(text)
     if not isinstance(data, dict) or not data.get("body"):
-        return {"error": "Could not parse the research result — please try again."}
+        # Surface what the model actually said so the user knows how to help it.
+        hint = ("Tip: paste the job's description text under the link — LinkedIn often can't be "
+                "read from just a URL.")
+        if text:
+            return {"error": f"The AI couldn't produce a finished draft.\n\nIt said:\n{text[:600]}\n\n{hint}"}
+        return {"error": f"No result came back — please try again. {hint}"}
 
     data["body"] = data["body"].strip() + _footer()
     if not (data.get("subject") or "").strip():
