@@ -203,6 +203,7 @@ def run_daily_discovery(force=False):
     created = 0
     skipped = 0
     failed_sources = 0
+    detail = []  # persisted per-source diagnostic
 
     with st.status(f"🌅 Morning run — searching {len(sources)} job source(s) for new design jobs...",
                    expanded=True) as status:
@@ -222,9 +223,11 @@ def run_daily_discovery(force=False):
                 if feed['status'] == 'ERROR':
                     failed_sources += 1
                     st.write(f"⚠️ Could not read {name}: {feed['error']}")
+                    detail.append(f"❌ {name}: unreachable — {feed['error']}")
                     continue
                 work_items = [(j['url'], j) for j in feed['jobs']]
                 st.write(f"   ↳ feed returned {len(work_items)} design job(s)")
+                detail.append(f"{'✅' if work_items else '⚪'} {name}: feed returned {len(work_items)} job(s)")
             else:
                 try:
                     scraped = scrape_source(source['url'])
@@ -233,9 +236,12 @@ def run_daily_discovery(force=False):
                 if scraped['status'] == 'ERROR':
                     failed_sources += 1
                     st.write(f"⚠️ Could not read {name}: {scraped['error']}")
+                    detail.append(f"❌ {name}: unreachable — {scraped['error']}")
                     continue
                 work_items = [(u, None) for u in scraped['job_urls']]
                 st.write(f"   ↳ page scrape found {len(work_items)} link(s)")
+                detail.append(f"{'✅' if work_items else '⚪'} {name}: page scrape found "
+                              f"{len(work_items)} link(s)")
 
             if not work_items:
                 st.write("No design job links found on this source.")
@@ -268,6 +274,7 @@ def run_daily_discovery(force=False):
 
         set_state('last_run_time', ist_now().strftime('%d %b %Y, %I:%M %p IST'))
         set_state('last_run_summary', summary)
+        set_state('last_run_detail', "\n".join(detail) if detail else "(no sources ran)")
         status.update(label=f"🌅 Morning run complete — {summary}", state="complete", expanded=True)
 
     if created:
@@ -754,6 +761,10 @@ def page_settings():
     last_summary = get_state('last_run_summary')
     if last_run:
         st.info(f"Last run: {last_run} — {last_summary or ''}")
+        last_detail = get_state('last_run_detail')
+        if last_detail:
+            with st.expander("Last run — what each source returned"):
+                st.text(last_detail)
 
     sources = list_job_sources()
     if not sources:
