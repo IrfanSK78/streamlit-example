@@ -28,6 +28,9 @@ DEFAULT_SOURCES = [
     ('https://remoteok.com/remote-design-jobs', 'RemoteOK - Design'),
     ('https://jobspresso.co/remote-design-jobs/', 'Jobspresso - Design'),
     ('https://remotive.com/remote-jobs/design', 'Remotive - Design'),
+    ('https://remote.co/remote-jobs/design/', 'Remote.co - Design'),
+    ('https://www.workingnomads.com/jobs?category=design', 'Working Nomads - Design'),
+    ('https://justremote.co/remote-design-jobs', 'JustRemote - Design'),
 ]
 
 def ist_now():
