@@ -315,109 +315,151 @@ def page_discover_lead():
 
     st.info("Go to **Pending Approvals** in the sidebar to approve it.")
 
+def _save_lead(company, role, contact_name, contact_title, contact_email, subject, body,
+               job_ref, summary, audit_detail):
+    """Create a DRAFT_READY lead with contact info and jump to Pending Approvals."""
+    lead_id = create_lead({
+        'company_name': company,
+        'company_domain': None,
+        'company_website': None,
+        'job_title': role,
+        'job_url': (job_ref or '')[:500],
+        'job_description': summary,
+        'date_discovered': ist_now().isoformat(),
+        'outreach_subject': subject,
+        'outreach_email': body,
+        'lead_fit_score': None,
+        'fit_score_reasons': None,
+        'status': 'DRAFT_READY',
+    })
+    update_lead(lead_id, {
+        'contact_name': contact_name,
+        'contact_title': contact_title,
+        'contact_email': (contact_email or '').strip() or None,
+    })
+    log_audit(lead_id, 'LEAD_ADDED', actor='USER', details=audit_detail)
+    log_audit(lead_id, 'EMAIL_DRAFTED', actor='SYSTEM', details=audit_detail)
+    st.session_state.last_research = None
+    st.session_state.flash = "✅ Saved to Pending Approvals — review and send it there."
+    st.session_state.current_page = "approvals"
+    st.rerun()
+
 def page_research_lead():
-    """Page: Paste a job (e.g. LinkedIn), research the company + founder, draft an email."""
-    st.header("🔎 Research a Job")
-    st.write("Paste a job posting — a LinkedIn link works best with the job text pasted below it. "
-             "The AI researches the company, finds the founder or decision-maker and a contact email, "
-             "and drafts an outreach email addressed to them.")
+    """Page: turn a job + a contact into a ready-to-send email (cheap manual flow first)."""
+    st.header("🔎 Add a Lead")
 
     try:
-        from mailer.lead_researcher import research_and_write
-        from mailer.ai_writer import is_ai_available
+        from mailer.ai_writer import write_email, is_ai_available
         ai_on = is_ai_available()
     except Exception:
         ai_on = False
 
     if not ai_on:
-        st.warning("This page needs AI. Add an Anthropic API key in **Settings → (how to turn on AI writing)** "
-                   "first, then come back.")
+        st.warning("This page needs AI. Add an Anthropic API key in **Settings** first, then come back.")
         return
 
-    job_input = st.text_area(
-        "Job link and/or pasted job description",
+    st.write("Do the research wherever you like — even ChatGPT — then paste what you found here. "
+             "Claude writes the on-brand email and it's ready to **approve & send**. "
+             "This costs about **2–3¢** and uses no web search.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        contact_name = st.text_input("Contact name", placeholder="Jack L")
+        company = st.text_input("Company", placeholder="Pumpkin Global")
+    with c2:
+        contact_email = st.text_input("Contact email", placeholder="jack@pumpkin.xyz")
+        role = st.text_input("Role / job title", placeholder="Product Designer")
+
+    details = st.text_area(
+        "Job details / notes (paste the job description or your research here)",
         height=180,
-        placeholder="https://www.linkedin.com/jobs/view/1234567890/\n\n(Optional but recommended: paste the "
-                    "job description text here too for the most accurate result.)"
+        placeholder="Paste the job description, or ChatGPT's summary of the role and company — "
+                    "the more detail, the more tailored the email."
     )
 
-    if st.button("🔎 Research & Draft Email", type="primary") and job_input.strip():
-        with st.spinner("Researching the company, finding the decision-maker, and drafting the email… "
-                        "this can take up to a minute."):
-            st.session_state.last_research = research_and_write(job_input)
+    if st.button("✍️ Write the email", type="primary"):
+        if not (company.strip() or details.strip()):
+            st.warning("Add at least a company name or some job details.")
+        else:
+            with st.spinner("Writing the email…"):
+                res = write_email(
+                    job_title=role.strip() or 'design role',
+                    job_description=details.strip(),
+                    company_name=company.strip(),
+                    recipient_email=contact_email.strip() or None,
+                    contact_name=contact_name.strip() or None,
+                )
+            if not res:
+                res = {'error': 'Could not write the email — please try again.'}
+            res['_company'] = company.strip()
+            res['_role'] = role.strip()
+            res['_contact_name'] = contact_name.strip()
+            res['_contact_email'] = contact_email.strip()
+            res['_details'] = details.strip()
+            st.session_state.last_manual = res
 
-    data = st.session_state.get('last_research')
-    if not data:
-        return
+    res = st.session_state.get('last_manual')
+    if res:
+        if res.get('error'):
+            st.error(res['error'])
+        else:
+            st.success("✅ Email written — review below, then save it to Pending Approvals.")
+            if res.get('_contact_name') or res.get('_contact_email'):
+                to = res.get('_contact_name') or ''
+                if res.get('_contact_email'):
+                    to += f" <{res['_contact_email']}>"
+                st.write(f"**To:** {to.strip()}")
+                if res.get('_contact_email'):
+                    st.caption("⚠️ Double-check this address before sending.")
+            st.text_input("Subject", value=res.get('subject', ''), disabled=True, key="manual_subj")
+            st.text_area("Email", value=res.get('body', ''), height=320, disabled=True, key="manual_body")
+            if st.button("💾 Save to Pending Approvals", type="primary", key="save_manual"):
+                _save_lead(res.get('_company'), res.get('_role'), res.get('_contact_name') or None,
+                           None, res.get('_contact_email'), res.get('subject'), res.get('body'),
+                           res.get('_company'), res.get('_details') or None,
+                           f"Manual: {res.get('_contact_name')} <{res.get('_contact_email')}>")
 
-    if data.get('error'):
-        st.error(data['error'])
-        return
+    st.divider()
+    with st.expander("🌐 Or let the app research it for you (uses web search — costs more)"):
+        st.caption("Claude searches the web to find the company, the founder and an email. "
+                   "This costs roughly **10–30¢ per try, even if it can't finish**, and works best when "
+                   "you paste the full job description text — not just a link. ChatGPT is often a cheaper "
+                   "way to do this part.")
+        job_input = st.text_area(
+            "Job link and/or pasted job description",
+            height=140,
+            key="auto_research_input",
+            placeholder="https://www.linkedin.com/jobs/view/1234567890/\n\n(Paste the full job description "
+                        "text here for it to work — a link alone usually isn't enough.)"
+        )
+        if st.button("🌐 Research with web search", key="auto_research_btn"):
+            if not job_input.strip():
+                st.warning("Paste a job first.")
+            else:
+                from mailer.lead_researcher import research_and_write
+                with st.spinner("Researching (up to a minute)…"):
+                    st.session_state.last_research = research_and_write(job_input)
 
-    st.success("✅ Research complete — review below, then save it to Pending Approvals.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write(f"**Company:** {data.get('company') or 'Unknown'}")
-        st.write(f"**Role:** {data.get('role') or 'Unknown'}")
-        st.write(f"**Location:** {data.get('location') or 'Unknown'}")
-    with col2:
-        st.write(f"**Contact:** {data.get('contact_name') or 'Unknown'}")
-        st.write(f"**Title:** {data.get('contact_title') or 'Unknown'}")
-
-    if data.get('role_summary'):
-        with st.expander("What the role focuses on"):
-            st.write(data['role_summary'])
-
-    # Contact email — always flag for verification.
-    email_addr = (data.get('contact_email') or '').strip()
-    confidence = (data.get('email_confidence') or 'unknown').lower()
-    st.subheader("📇 Contact email")
-    if email_addr:
-        badge = {'published': '🟢 published on a public source',
-                 'inferred': '🟡 inferred from the company email pattern',
-                 'unknown': '⚪ uncertain'}.get(confidence, '⚪ uncertain')
-        st.write(f"**{email_addr}**  —  {badge}")
-        if data.get('email_source'):
-            st.caption(f"Source: {data['email_source']}")
-        st.warning("⚠️ Always verify this address before sending — AI-found emails can be wrong.")
-    else:
-        st.warning("No contact email found. You can add one yourself before sending.")
-
-    if data.get('notes'):
-        st.info(f"**Worth checking:** {data['notes']}")
-
-    st.subheader("📧 Drafted email")
-    st.text_input("Subject", value=data.get('subject', ''), disabled=True, key="research_subj")
-    st.text_area("Email", value=data.get('body', ''), height=320, disabled=True, key="research_body")
-
-    if st.button("💾 Save to Pending Approvals", type="primary"):
-        lead_id = create_lead({
-            'company_name': data.get('company'),
-            'company_domain': None,
-            'company_website': None,
-            'job_title': data.get('role'),
-            'job_url': job_input.strip()[:500],
-            'job_description': data.get('role_summary'),
-            'date_discovered': ist_now().isoformat(),
-            'outreach_subject': data.get('subject'),
-            'outreach_email': data.get('body'),
-            'lead_fit_score': None,
-            'fit_score_reasons': None,
-            'status': 'DRAFT_READY',
-        })
-        update_lead(lead_id, {
-            'contact_name': data.get('contact_name'),
-            'contact_title': data.get('contact_title'),
-            'contact_email': email_addr or None,
-        })
-        log_audit(lead_id, 'LEAD_RESEARCHED', actor='USER',
-                  details=f"Contact: {data.get('contact_name')} <{email_addr}> ({confidence})")
-        log_audit(lead_id, 'EMAIL_DRAFTED', actor='SYSTEM', details='AI web research')
-        st.session_state.last_research = None
-        st.session_state.flash = "✅ Saved to Pending Approvals — review and approve it there."
-        st.session_state.current_page = "approvals"
-        st.rerun()
+        data = st.session_state.get('last_research')
+        if data and data.get('error'):
+            st.error(data['error'])
+        elif data:
+            email_addr = (data.get('contact_email') or '').strip()
+            st.write(f"**Company:** {data.get('company') or 'Unknown'} · "
+                     f"**Role:** {data.get('role') or 'Unknown'}")
+            st.write(f"**Contact:** {data.get('contact_name') or 'Unknown'} "
+                     f"({data.get('contact_title') or '—'}) · **Email:** {email_addr or 'not found'}")
+            if data.get('email_source'):
+                st.caption(f"Email source: {data['email_source']}")
+            if email_addr:
+                st.warning("⚠️ Verify this address before sending.")
+            st.text_input("Subject", value=data.get('subject', ''), disabled=True, key="auto_subj")
+            st.text_area("Email", value=data.get('body', ''), height=280, disabled=True, key="auto_body")
+            if st.button("💾 Save to Pending Approvals", key="save_auto"):
+                _save_lead(data.get('company'), data.get('role'), data.get('contact_name'),
+                           data.get('contact_title'), email_addr, data.get('subject'),
+                           data.get('body'), job_input, data.get('role_summary'),
+                           f"Web research: {data.get('contact_name')} <{email_addr}>")
 
 def page_approval_queue():
     """Page: Review and approve pending emails (max 20 per day)."""
@@ -828,7 +870,7 @@ def main():
     st.sidebar.title("Invasive Outreach Agent")
 
     if 'current_page' not in st.session_state:
-        st.session_state.current_page = "discover"
+        st.session_state.current_page = "research"
 
     # Run discovery BEFORE rendering the sidebar badge so the counts are fresh.
     force_run = st.session_state.pop('force_run', False)
@@ -859,10 +901,10 @@ def main():
         page_review_email()
         return
 
-    page_options = ["Discover Lead", "Research a Job", "Pending Approvals", "Lead History", "Settings"]
+    page_options = ["Add a Lead", "Discover Lead", "Pending Approvals", "Lead History", "Settings"]
     page_index = {
-        "discover": 0,
-        "research": 1,
+        "research": 0,
+        "discover": 1,
         "approvals": 2,
         "leads": 3,
         "settings": 4
@@ -870,12 +912,12 @@ def main():
 
     page = st.sidebar.radio("Navigation", page_options, index=page_index)
 
-    if page == "Discover Lead":
-        st.session_state.current_page = "discover"
-        page_discover_lead()
-    elif page == "Research a Job":
+    if page == "Add a Lead":
         st.session_state.current_page = "research"
         page_research_lead()
+    elif page == "Discover Lead":
+        st.session_state.current_page = "discover"
+        page_discover_lead()
     elif page == "Pending Approvals":
         st.session_state.current_page = "approvals"
         page_approval_queue()
