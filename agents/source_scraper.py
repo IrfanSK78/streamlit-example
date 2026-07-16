@@ -33,6 +33,7 @@ SKIP_PATH_SEGMENTS = {
 MAX_LINKS_PER_SOURCE = 15
 
 REMOTIVE_API = "https://remotive.com/api/remote-jobs"
+REMOTEOK_API = "https://remoteok.com/api"
 
 def looks_like_design_job(text):
     """True if the text looks like a design role title."""
@@ -49,6 +50,10 @@ def fetch_structured_jobs(source_url):
     host = urlparse(source_url).netloc.lower()
     if 'remotive.com' in host:
         return _fetch_remotive()
+    if 'remoteok.com' in host or 'remoteok.io' in host:
+        return _fetch_remoteok()
+    if 'weworkremotely.com' in host:
+        return _fetch_weworkremotely(source_url)
     return None
 
 def _strip_html(html):
@@ -86,6 +91,77 @@ def _fetch_remotive():
             'company_name': (item.get('company_name') or '').strip() or None,
             'company_domain': None,  # the feed gives the employer name, not its domain
             'job_description': _strip_html(item.get('description') or '')[:5000],
+        })
+        if len(jobs) >= MAX_LINKS_PER_SOURCE:
+            break
+    return {'status': 'SUCCESS', 'error': None, 'jobs': jobs}
+
+def _fetch_remoteok():
+    """Fetch design jobs from RemoteOK's free public JSON API."""
+    try:
+        response = requests.get(REMOTEOK_API, timeout=15, headers=HEADERS)
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.Timeout:
+        return {'status': 'ERROR', 'error': 'Request timed out', 'jobs': []}
+    except Exception as e:
+        return {'status': 'ERROR', 'error': str(e), 'jobs': []}
+
+    jobs = []
+    for item in (data if isinstance(data, list) else []):
+        if not isinstance(item, dict):
+            continue
+        title = (item.get('position') or item.get('title') or '').strip()
+        if not title:  # the first element is a legal/metadata notice
+            continue
+        tags = ' '.join(item.get('tags') or []) if isinstance(item.get('tags'), list) else ''
+        if not (looks_like_design_job(title) or looks_like_design_job(tags)):
+            continue
+        url = item.get('url') or item.get('apply_url')
+        if not url:
+            continue
+        jobs.append({
+            'url': url,
+            'job_title': title,
+            'company_name': (item.get('company') or '').strip() or None,
+            'company_domain': None,
+            'job_description': _strip_html(item.get('description') or '')[:5000],
+        })
+        if len(jobs) >= MAX_LINKS_PER_SOURCE:
+            break
+    return {'status': 'SUCCESS', 'error': None, 'jobs': jobs}
+
+def _fetch_weworkremotely(source_url):
+    """Fetch design jobs from We Work Remotely's RSS feed (reliable, server-side XML)."""
+    import xml.etree.ElementTree as ET
+    rss_url = source_url.split('?')[0].rstrip('/') + '.rss'
+    try:
+        response = requests.get(rss_url, timeout=15, headers=HEADERS)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+    except requests.exceptions.Timeout:
+        return {'status': 'ERROR', 'error': 'Request timed out', 'jobs': []}
+    except Exception as e:
+        return {'status': 'ERROR', 'error': str(e), 'jobs': []}
+
+    jobs = []
+    for item in root.iter('item'):
+        title = (item.findtext('title') or '').strip()
+        link = (item.findtext('link') or '').strip()
+        if not title or not link:
+            continue
+        # WWR titles are usually "Company Name: Job Title".
+        company, role = None, title
+        if ':' in title:
+            left, right = title.split(':', 1)
+            if left.strip() and right.strip():
+                company, role = left.strip(), right.strip()
+        jobs.append({
+            'url': link,
+            'job_title': role,
+            'company_name': company,
+            'company_domain': None,
+            'job_description': _strip_html(item.findtext('description') or '')[:5000],
         })
         if len(jobs) >= MAX_LINKS_PER_SOURCE:
             break
