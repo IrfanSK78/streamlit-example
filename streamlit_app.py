@@ -224,6 +224,7 @@ def run_daily_discovery(force=False):
                     st.write(f"⚠️ Could not read {name}: {feed['error']}")
                     continue
                 work_items = [(j['url'], j) for j in feed['jobs']]
+                st.write(f"   ↳ feed returned {len(work_items)} design job(s)")
             else:
                 try:
                     scraped = scrape_source(source['url'])
@@ -234,6 +235,7 @@ def run_daily_discovery(force=False):
                     st.write(f"⚠️ Could not read {name}: {scraped['error']}")
                     continue
                 work_items = [(u, None) for u in scraped['job_urls']]
+                st.write(f"   ↳ page scrape found {len(work_items)} link(s)")
 
             if not work_items:
                 st.write("No design job links found on this source.")
@@ -266,7 +268,7 @@ def run_daily_discovery(force=False):
 
         set_state('last_run_time', ist_now().strftime('%d %b %Y, %I:%M %p IST'))
         set_state('last_run_summary', summary)
-        status.update(label=f"🌅 Morning run complete — {summary}", state="complete", expanded=False)
+        status.update(label=f"🌅 Morning run complete — {summary}", state="complete", expanded=True)
 
     if created:
         st.success(f"🌅 {created} new emails are waiting in **Pending Approvals**.")
